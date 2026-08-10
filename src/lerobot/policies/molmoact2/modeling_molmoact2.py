@@ -627,6 +627,30 @@ class MolmoAct2Policy(PreTrainedPolicy):
         self._action_queue = deque(maxlen=self.config.n_action_steps)
         self._rollout_action_generator = None
 
+    def snapshot_inference_rng_state(self) -> dict[str, Any]:
+        """Capture task-local rollout sampling state around synthetic inference."""
+
+        generator = self._rollout_action_generator
+        return {
+            "rollout_task_key": self._rollout_task_key,
+            "rollout_index_for_task": self._rollout_index_for_task,
+            "generator_device": str(generator.device) if generator is not None else None,
+            "generator_state": generator.get_state().clone() if generator is not None else None,
+        }
+
+    def restore_inference_rng_state(self, state: dict[str, Any]) -> None:
+        """Restore state returned by :meth:`snapshot_inference_rng_state`."""
+
+        self._rollout_task_key = state["rollout_task_key"]
+        self._rollout_index_for_task = int(state["rollout_index_for_task"])
+        generator_state = state["generator_state"]
+        if generator_state is None:
+            self._rollout_action_generator = None
+            return
+        generator = torch.Generator(device=state["generator_device"])
+        generator.set_state(generator_state)
+        self._rollout_action_generator = generator
+
     def _set_inference_cuda_graph_enabled(self, enabled: bool) -> None:
         if not hasattr(self, "model"):
             return
@@ -935,7 +959,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
             )
         else:
             expected_timesteps_shape = (batch_size, num_flow_timesteps)
-            timesteps = timesteps.to(device=device, dtype=action_dtype)
+            timesteps = timesteps.to(device=device, dtype=actions.dtype)
             if tuple(timesteps.shape) != expected_timesteps_shape:
                 raise ValueError(
                     f"flow timesteps must have shape {expected_timesteps_shape}, got {tuple(timesteps.shape)}."

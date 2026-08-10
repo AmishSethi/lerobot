@@ -10,6 +10,7 @@ import time
 import numpy as np
 import pytest
 
+from lerobot.remote_inference import remote_policy_pb2
 from lerobot.remote_inference.backend import (
     DeterministicPolicyBackend,
     DeterministicPolicyBackendConfig,
@@ -114,12 +115,41 @@ def test_server_rejects_client_ca_without_tls_identity():
         RemotePolicyServerConfig(tls_client_ca_path="ca.pem").validate()
 
 
+def test_server_runtime_contract_digest_binds_ttl_and_revision() -> None:
+    config = RemotePolicyServerConfig(command_ttl_ms=1000, server_revision="reviewed-revision")
+
+    digest = config.runtime_contract_sha256()
+
+    assert len(digest) == 64
+    assert config.canonical_runtime_contract()["command_ttl_ms"] == 1000
+    assert config.canonical_runtime_contract()["server_revision"] == "reviewed-revision"
+    assert (
+        digest
+        != RemotePolicyServerConfig(
+            command_ttl_ms=1001,
+            server_revision="reviewed-revision",
+        ).runtime_contract_sha256()
+    )
+
+    encoded = remote_policy_pb2.OpenSessionResponse(
+        session_id="session",
+        command_ttl_ms=1000,
+        server_revision="reviewed-revision",
+        server_config_sha256=digest,
+    ).SerializeToString()
+    decoded = remote_policy_pb2.OpenSessionResponse.FromString(encoded)
+    assert decoded.server_revision == "reviewed-revision"
+    assert decoded.server_config_sha256 == digest
+
+
 def test_end_to_end_session_and_inference(running_server):
     client = make_client(running_server)
     session = client.connect(make_manifest(), task="test task", client_instance_id="client")
     action = client.infer(make_observation())
 
     assert session.model.action_horizon == 4
+    assert session.server_revision == "development"
+    assert len(session.server_config_sha256) == 64
     assert action.actions.shape == (4, 3)
     assert np.allclose(action.actions, [[0.1, 0.2, 0.3]] * 4)
     assert action.observation_sequence == 1

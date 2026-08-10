@@ -100,6 +100,16 @@ def model_to_proto(model: ModelManifest) -> remote_policy_pb2.ModelManifest:
         action_features=model.action_features,
         camera_keys=model.camera_keys,
         fingerprint=model.fingerprint,
+        gripper_action_representation=model.gripper_action_representation,
+        artifact_tree_sha256=model.artifact_tree_sha256,
+        artifact_manifest_sha256=model.artifact_manifest_sha256,
+        runtime_dependency_tree_sha256=model.runtime_dependency_tree_sha256,
+        runtime_dependency_manifest_sha256=model.runtime_dependency_manifest_sha256,
+        inference_backend_mode=model.inference_backend_mode,
+        inference_seed=model.inference_seed,
+        inference_code_manifest_sha256=model.inference_code_manifest_sha256,
+        inference_attestation_identity_sha256=model.inference_attestation_identity_sha256,
+        ik_release_report_sha256=model.ik_release_report_sha256,
     )
 
 
@@ -115,6 +125,16 @@ def model_from_proto(message: remote_policy_pb2.ModelManifest) -> ModelManifest:
         action_features=tuple(message.action_features),
         camera_keys=tuple(message.camera_keys),
         fingerprint=message.fingerprint,
+        gripper_action_representation=message.gripper_action_representation,
+        artifact_tree_sha256=message.artifact_tree_sha256,
+        artifact_manifest_sha256=message.artifact_manifest_sha256,
+        runtime_dependency_tree_sha256=message.runtime_dependency_tree_sha256,
+        runtime_dependency_manifest_sha256=message.runtime_dependency_manifest_sha256,
+        inference_backend_mode=message.inference_backend_mode,
+        inference_seed=message.inference_seed,
+        inference_code_manifest_sha256=message.inference_code_manifest_sha256,
+        inference_attestation_identity_sha256=message.inference_attestation_identity_sha256,
+        ik_release_report_sha256=message.ik_release_report_sha256,
     )
     model.validate()
     return model

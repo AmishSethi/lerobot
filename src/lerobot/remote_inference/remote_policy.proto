@@ -65,6 +65,16 @@ message ModelManifest {
   repeated string action_features = 8;
   repeated string camera_keys = 9;
   string fingerprint = 10;
+  string gripper_action_representation = 11;
+  string artifact_tree_sha256 = 12;
+  string ik_release_report_sha256 = 13;
+  string artifact_manifest_sha256 = 14;
+  string runtime_dependency_tree_sha256 = 15;
+  string runtime_dependency_manifest_sha256 = 16;
+  string inference_backend_mode = 17;
+  int64 inference_seed = 18;
+  string inference_code_manifest_sha256 = 19;
+  string inference_attestation_identity_sha256 = 20;
 }
 
 message ServerInfo {
@@ -85,6 +95,8 @@ message OpenSessionResponse {
   string session_id = 1;
   ModelManifest model = 2;
   uint32 command_ttl_ms = 3;
+  string server_revision = 4;
+  string server_config_sha256 = 5;
 }
 
 message ImageFrame {

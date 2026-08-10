@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
@@ -55,6 +56,10 @@ class PI05Config(PreTrainedConfig):
     relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
     # Populated at runtime from dataset metadata by make_policy.
     action_feature_names: list[str] | None = None
+    # Preserve the raw (pre-padding) state/action names independently.  The two
+    # name sets differ for query-anchored current-relative datasets and are part
+    # of the remote-inference manifest contract.
+    dataset_feature_names: dict[str, Any] = field(default_factory=dict)
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
@@ -120,6 +125,13 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+    def set_dataset_feature_metadata(self, features: dict[str, Any]) -> None:
+        self.dataset_feature_names = {}
+        for key in (OBS_STATE, ACTION):
+            names = features.get(key, {}).get("names")
+            if names is not None:
+                self.dataset_feature_names[key] = list(names)
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

@@ -10,6 +10,12 @@ robot + cameras -> lerobot-rollout -> network -> lerobot-policy-server -> action
 The client only needs a reachable server address. A router, SSH relay, or other
 network proxy can sit between the machines without changing either command.
 
+> [!CAUTION]
+> The original 54-episode UMI onset-v3 checkpoints have a separate, fail-closed
+> experimental trial procedure in
+> [`README_yam_umi_onset_v3_hardware_trial.md`](../../src/lerobot/remote_inference/README_yam_umi_onset_v3_hardware_trial.md).
+> Do not apply the generic commands below to those checkpoints.
+
 ## Install
 
 On a fresh Ubuntu machine, install the system packages needed to build the

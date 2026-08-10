@@ -786,31 +786,30 @@ class PI05Policy(PreTrainedPolicy):
         # Check if dataset_stats were provided in kwargs
         model = cls(config, **kwargs)
 
-        # Load state dict (expects keys with "model." prefix)
+        # Load state dict (expects keys with "model." prefix). This must fail closed:
+        # returning the initialized model after any checkpoint error silently starts a
+        # fine-tuning run from random weights.
+        print(f"Loading model from: {pretrained_name_or_path}")
         try:
-            print(f"Loading model from: {pretrained_name_or_path}")
-            try:
-                from transformers.utils import cached_file
+            from safetensors.torch import load_file
+            from transformers.utils import cached_file
 
-                resolved_file = cached_file(
-                    pretrained_name_or_path,
-                    "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    token=kwargs.get("token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
-                )
-                from safetensors.torch import load_file
+            resolved_file = cached_file(
+                pretrained_name_or_path,
+                "model.safetensors",
+                cache_dir=cache_dir,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                revision=revision,
+                local_files_only=local_files_only,
+            )
+            if resolved_file is None:
+                raise FileNotFoundError(f"model.safetensors was not resolved from {pretrained_name_or_path}")
 
-                original_state_dict = load_file(resolved_file)
-                print("✓ Loaded state dict from model.safetensors")
-            except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
-                return model
+            original_state_dict = load_file(resolved_file)
+            print("✓ Loaded state dict from model.safetensors")
 
             # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
@@ -857,7 +856,9 @@ class PI05Policy(PreTrainedPolicy):
                 print("All keys loaded successfully!")
 
         except Exception as e:
-            print(f"Warning: Could not load state dict: {e}")
+            raise RuntimeError(
+                f"Failed to load PI05 pretrained weights from {pretrained_name_or_path}"
+            ) from e
 
         return model
 
@@ -955,14 +956,10 @@ class PI05Policy(PreTrainedPolicy):
         Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
         PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
         """
-        images = []
-        img_masks = []
-
         # Get device from model parameters
         device = next(self.parameters()).device
 
         present_img_keys = [key for key in self.config.image_features if key in batch]
-        missing_img_keys = [key for key in self.config.image_features if key not in batch]
 
         if len(present_img_keys) == 0:
             raise ValueError(
@@ -970,7 +967,13 @@ class PI05Policy(PreTrainedPolicy):
                 f"(batch: {batch.keys()}) (image_features: {self.config.image_features})"
             )
 
-        # Preprocess image features present in the batch
+        # Preprocess image features present in the batch, then assemble the final
+        # list in configured slot order.  A missing leading camera (for example the
+        # base camera) must stay a missing leading slot; appending all missing
+        # cameras after the present ones silently reassigns wrist images to the
+        # wrong positional image-token blocks.
+        processed_images = {}
+        processed_masks = {}
         for key in present_img_keys:
             img = batch[key]
 
@@ -1000,18 +1003,23 @@ class PI05Policy(PreTrainedPolicy):
             if is_channels_first:
                 img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
 
-            images.append(img)
             # Create mask (all ones for real images)
             bsize = img.shape[0]
             mask = torch.ones(bsize, dtype=torch.bool, device=device)
-            img_masks.append(mask)
+            processed_images[key] = img
+            processed_masks[key] = mask
 
-        # Create image features not present in the batch as fully 0 padded images
-        for _num_empty_cameras in range(len(missing_img_keys)):
-            img = torch.ones_like(img) * -1  # Padded with -1 for SigLIP
-            mask = torch.zeros_like(mask)  # Mask is zero for empty cameras
-            images.append(img)
-            img_masks.append(mask)
+        template_img = processed_images[present_img_keys[0]]
+        template_mask = processed_masks[present_img_keys[0]]
+        images = []
+        img_masks = []
+        for key in self.config.image_features:
+            if key in processed_images:
+                images.append(processed_images[key])
+                img_masks.append(processed_masks[key])
+            else:
+                images.append(torch.full_like(template_img, -1))  # SigLIP padding value
+                img_masks.append(torch.zeros_like(template_mask))
 
         return images, img_masks
 

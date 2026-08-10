@@ -17,10 +17,11 @@
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, TextIO
 
 import draccus
@@ -44,13 +45,15 @@ from .config_bi_yam import (
     YAMArmConfig,
     YAMGripperCalibration,
 )
-from .worker import ArmCommand, ArmState, ArmWorker, ProcessArmWorker
+from .worker import ArmCommand, ArmCommandError, ArmState, ArmWorker, ProcessArmWorker
 
 logger = logging.getLogger(__name__)
 
 WorkerFactory = Callable[[str, YAMArmConfig], ArmWorker]
 CameraFactory = Callable[[dict[str, Any]], dict[str, Camera]]
 CANDiscovery = Callable[[], list[CANInterfaceInfo]]
+PreDispatchValidator = Callable[[Mapping[str, float]], object]
+MeasuredActionResolver = Callable[[Mapping[str, float]], RobotAction]
 
 
 class BiYAMFollower(Robot):
@@ -67,6 +70,7 @@ class BiYAMFollower(Robot):
         camera_factory: CameraFactory | None = None,
         can_discovery: CANDiscovery = discover_can_interfaces,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
+        pre_dispatch_validator: PreDispatchValidator | None = None,
     ):
         self._yam_calibration: dict[str, YAMGripperCalibration] = {}
         super().__init__(config)
@@ -83,6 +87,9 @@ class BiYAMFollower(Robot):
         self._command_sequence = 0
         self._control_telemetry_file: TextIO | None = None
         self._last_control_summary_ns = 0
+        self._last_dispatch_timing: dict[str, Any] | None = None
+        self._pre_dispatch_validator: PreDispatchValidator | None = None
+        self.set_pre_dispatch_validator(pre_dispatch_validator)
 
     @property
     def observation_features(self) -> dict[str, type | tuple[int, int, int]]:
@@ -109,6 +116,31 @@ class BiYAMFollower(Robot):
     @property
     def is_armed(self) -> bool:
         return self._armed
+
+    @property
+    def has_pre_dispatch_validator(self) -> bool:
+        return self._pre_dispatch_validator is not None
+
+    @property
+    def last_dispatch_timing(self) -> dict[str, Any] | None:
+        """Return local controller/worker timing for the most recent dispatch."""
+
+        return None if self._last_dispatch_timing is None else dict(self._last_dispatch_timing)
+
+    def set_pre_dispatch_validator(self, validator: PreDispatchValidator | None) -> None:
+        """Install an optional endpoint gate before connecting to hardware.
+
+        The validator receives the exact operational- and per-call-clipped target
+        immediately before either worker is sent a command. A no-op policy reset
+        validates its fresh measured endpoint instead. This is an endpoint check,
+        not a continuous swept-path proof.
+        """
+
+        if self._connected:
+            raise RuntimeError("pre-dispatch validation must be configured before connecting BiYAM")
+        if validator is not None and not callable(validator):
+            raise TypeError("pre-dispatch validator must be callable or None")
+        self._pre_dispatch_validator = validator
 
     @property
     def state_metadata(self) -> dict[str, dict[str, int]]:
@@ -228,23 +260,85 @@ class BiYAMFollower(Robot):
             raise RuntimeError("BiYAM is in safe idle; arm it locally before sending actions")
 
         states = self._refresh_commandable_states()
+        present = self._control_positions(states)
+        return self._send_action_from_present(action, present)
+
+    def send_action_from_measured_state(
+        self,
+        resolver: MeasuredActionResolver,
+        *,
+        expires_at_monotonic_ns: int,
+        required_expiry_margin_ns: int,
+    ) -> RobotAction:
+        """Resolve and freshness-gate one action from the final dispatch state.
+
+        ``resolver`` receives the exact measured scalar snapshot used by the
+        driver's safety limiter. The resulting command carries an absolute local
+        monotonic deadline into both arm workers, which reject it at the hardware
+        dispatch tick when ``now > deadline``. No server clock is involved.
+        """
+
+        self._require_rollout_mode()
+        self._require_connected()
+        if not self._armed:
+            raise RuntimeError("BiYAM is in safe idle; arm it locally before sending actions")
+        if not callable(resolver):
+            raise TypeError("resolver must be callable")
+        if isinstance(expires_at_monotonic_ns, bool) or not isinstance(expires_at_monotonic_ns, int):
+            raise TypeError("expires_at_monotonic_ns must be an integer")
+        if expires_at_monotonic_ns < 0:
+            raise ValueError("expires_at_monotonic_ns must be non-negative")
+        if isinstance(required_expiry_margin_ns, bool) or not isinstance(required_expiry_margin_ns, int):
+            raise TypeError("required_expiry_margin_ns must be an integer")
+        if required_expiry_margin_ns < 0:
+            raise ValueError("required_expiry_margin_ns must be non-negative")
+
+        states = self._refresh_commandable_states()
+        present = self._control_positions(states)
+        measured = {key: float(value) for key, value in zip(YAM_SCALAR_KEYS, present, strict=True)}
+        try:
+            action = resolver(MappingProxyType(measured))
+        except Exception:
+            self._safe_idle_workers()
+            raise
+        return self._send_action_from_present(
+            action,
+            present,
+            expires_at_monotonic_ns=expires_at_monotonic_ns,
+            required_expiry_margin_ns=required_expiry_margin_ns,
+        )
+
+    def _send_action_from_present(
+        self,
+        action: RobotAction,
+        present: np.ndarray,
+        *,
+        expires_at_monotonic_ns: int | None = None,
+        required_expiry_margin_ns: int = 0,
+    ) -> RobotAction:
         try:
             requested = self._validate_action(action)
         except Exception:
             self._safe_idle_workers()
             raise
-        present = self._control_positions(states)
         bounded = np.clip(requested, *self._operational_bounds())
         applied = self._apply_safety_limits(requested, present)
-        applied_action = self._dispatch_positions(applied)
-        measured = self._control_positions(self._states)
+        applied_action = self._dispatch_positions(
+            applied,
+            expires_at_monotonic_ns=expires_at_monotonic_ns,
+            required_expiry_margin_ns=required_expiry_margin_ns,
+            state_before_dispatch=present,
+        )
+        # wait_applied() acknowledges that i2rt accepted the target. Its state is
+        # useful telemetry, but it is not evidence that the mechanism reached it.
+        state_at_acknowledgement = self._control_positions(self._states)
         self._record_control_telemetry(
             phase="policy",
             requested=requested,
             bounded=bounded,
             applied=applied,
             measured_before=present,
-            measured_after=measured,
+            measured_after=state_at_acknowledgement,
         )
         return applied_action
 
@@ -283,47 +377,13 @@ class BiYAMFollower(Robot):
         logger.info("Moving BiYAM to its %s", pose_name)
 
         try:
-            states = self._refresh_commandable_states()
-            start = self._control_positions(states)
-            max_error = float(np.max(np.abs(target - start)))
-            if max_error <= self.config.policy_reset_tolerance:
-                logger.info("BiYAM is already at its %s (max error %.4f)", pose_name, max_error)
-                return target_action
-
-            trajectory_steps = min(
-                max(int(np.ceil(max_error / self.config.policy_reset_step_size)), 1),
-                self.config.policy_reset_max_steps,
-            )
-            logger.info("Executing policy reset trajectory (%d steps)", trajectory_steps)
-            for waypoint in np.linspace(start, target, trajectory_steps + 1)[1:]:
-                loop_started_at = time.perf_counter()
-                states = self._refresh_commandable_states()
-                present = self._control_positions(states)
-                max_error = float(np.max(np.abs(target - present)))
-                if time.monotonic() - started_at >= self.config.policy_reset_timeout_s:
-                    raise TimeoutError(
-                        f"BiYAM did not reach its {pose_name} within "
-                        f"{self.config.policy_reset_timeout_s:.1f}s (max error {max_error:.4f})"
-                    )
-                self._dispatch_positions(waypoint)
-                measured = self._control_positions(self._states)
-                self._record_control_telemetry(
-                    phase="reset",
-                    requested=waypoint,
-                    bounded=waypoint,
-                    applied=waypoint,
-                    measured_before=present,
-                    measured_after=measured,
-                )
-                time.sleep(max(0.0, control_interval_s - (time.perf_counter() - loop_started_at)))
-
-            # Keep the final absolute target active until measured state settles.
-            while True:
+            for _dispatch_index in range(self.config.policy_reset_max_steps):
                 loop_started_at = time.perf_counter()
                 states = self._refresh_commandable_states()
                 present = self._control_positions(states)
                 max_error = float(np.max(np.abs(target - present)))
                 if max_error <= self.config.policy_reset_tolerance:
+                    self._validate_endpoint(present)
                     logger.info("BiYAM reached its %s (max error %.4f)", pose_name, max_error)
                     return target_action
                 if time.monotonic() - started_at >= self.config.policy_reset_timeout_s:
@@ -331,43 +391,196 @@ class BiYAMFollower(Robot):
                         f"BiYAM did not reach its {pose_name} within "
                         f"{self.config.policy_reset_timeout_s:.1f}s (max error {max_error:.4f})"
                     )
-                self._dispatch_positions(target)
+                # Replan every command from fresh measured state. An i2rt
+                # acknowledgement is not physical progress, so an open-loop
+                # linspace can accumulate an unsafe error when a mechanism lags.
+                requested = present + np.clip(
+                    target - present,
+                    -self.config.policy_reset_step_size,
+                    self.config.policy_reset_step_size,
+                )
+                bounded = np.clip(requested, *self._operational_bounds())
+                applied = self._apply_safety_limits(requested, present)
+                self._dispatch_positions(applied)
                 measured = self._control_positions(self._states)
                 self._record_control_telemetry(
-                    phase="reset_hold",
-                    requested=target,
-                    bounded=target,
-                    applied=target,
+                    phase="reset",
+                    requested=requested,
+                    bounded=bounded,
+                    applied=applied,
                     measured_before=present,
                     measured_after=measured,
                 )
                 time.sleep(max(0.0, control_interval_s - (time.perf_counter() - loop_started_at)))
+            states = self._refresh_commandable_states()
+            present = self._control_positions(states)
+            max_error = float(np.max(np.abs(target - present)))
+            if max_error <= self.config.policy_reset_tolerance:
+                self._validate_endpoint(present)
+                logger.info("BiYAM reached its %s (max error %.4f)", pose_name, max_error)
+                return target_action
+            raise TimeoutError(
+                f"BiYAM did not reach its {pose_name} within "
+                f"{self.config.policy_reset_max_steps} measured-progress dispatches "
+                f"(max error {max_error:.4f})"
+            )
         except (Exception, KeyboardInterrupt):
             self._safe_idle_workers()
             raise
 
-    def _dispatch_positions(self, applied: np.ndarray) -> RobotAction:
-        self._command_sequence += 1
-        command_sequence = self._command_sequence
-        execute_at_ns = self._monotonic_ns() + int(self.config.command_lead_time_s * 1e9)
-        commands = {
-            "left": ArmCommand(command_sequence, execute_at_ns, tuple(applied[:7])),
-            "right": ArmCommand(command_sequence, execute_at_ns, tuple(applied[7:])),
-        }
-
+    def _dispatch_positions(
+        self,
+        applied: np.ndarray,
+        *,
+        expires_at_monotonic_ns: int | None = None,
+        required_expiry_margin_ns: int = 0,
+        state_before_dispatch: np.ndarray | None = None,
+    ) -> RobotAction:
         try:
+            applied_action = self._validate_endpoint(applied)
+            self._command_sequence += 1
+            command_sequence = self._command_sequence
+            controller_dispatch_boundary_ns = self._monotonic_ns()
+            execute_at_ns = controller_dispatch_boundary_ns + int(self.config.command_lead_time_s * 1e9)
+            self._last_dispatch_timing = {
+                "command_sequence": command_sequence,
+                "controller_dispatch_boundary_monotonic_ns": controller_dispatch_boundary_ns,
+                "scheduled_execute_at_monotonic_ns": execute_at_ns,
+                "expires_at_monotonic_ns": expires_at_monotonic_ns,
+                "required_expiry_margin_ns": required_expiry_margin_ns,
+                "worker_applied_monotonic_ns": {},
+                "worker_dispatch_started_monotonic_ns": {},
+                "worker_driver_acknowledged_monotonic_ns": {},
+                "worker_rejected_monotonic_ns": None,
+                "deadline_enforced_in_worker": expires_at_monotonic_ns is not None,
+                "two_arm_dispatch_atomic": False,
+                "state_before_dispatch": (
+                    None if state_before_dispatch is None else state_before_dispatch.tolist()
+                ),
+            }
+            if (
+                expires_at_monotonic_ns is not None
+                and execute_at_ns + required_expiry_margin_ns > expires_at_monotonic_ns
+            ):
+                raise RuntimeError(
+                    "command freshness deadline lacks the required reviewed worker dispatch margin"
+                )
+            commands = {
+                "left": ArmCommand(
+                    command_sequence,
+                    execute_at_ns,
+                    tuple(applied[:7]),
+                    expires_at_monotonic_ns,
+                ),
+                "right": ArmCommand(
+                    command_sequence,
+                    execute_at_ns,
+                    tuple(applied[7:]),
+                    expires_at_monotonic_ns,
+                ),
+            }
+            worker_applied_monotonic_ns = {}
+            worker_dispatch_started_monotonic_ns = {}
+            worker_driver_acknowledged_monotonic_ns = {}
             for side, worker in self._workers.items():
                 worker.send_command(commands[side])
             for side, worker in self._workers.items():
-                state = worker.wait_applied(command_sequence, self.config.command_ack_timeout_s)
+                try:
+                    state = worker.wait_applied(command_sequence, self.config.command_ack_timeout_s)
+                except ArmCommandError as exc:
+                    if exc.state.last_applied_command_sequence == command_sequence:
+                        if exc.state.last_dispatch_started_monotonic_ns is not None:
+                            worker_dispatch_started_monotonic_ns[exc.side] = (
+                                exc.state.last_dispatch_started_monotonic_ns
+                            )
+                            worker_applied_monotonic_ns[exc.side] = (
+                                exc.state.last_dispatch_started_monotonic_ns
+                            )
+                        if exc.state.last_driver_acknowledged_monotonic_ns is not None:
+                            worker_driver_acknowledged_monotonic_ns[exc.side] = (
+                                exc.state.last_driver_acknowledged_monotonic_ns
+                            )
+                    worker_rejected_monotonic_ns = {
+                        exc.side: (
+                            exc.state.fault_monotonic_ns
+                            if exc.state.fault_monotonic_ns is not None
+                            else exc.state.timestamp_ns
+                        )
+                    }
+                    self._safe_idle_workers()
+                    # The two workers execute independently. Inspect the peer
+                    # after issuing the unconditional two-arm idle so telemetry retains
+                    # evidence when one side applied just before the other
+                    # rejected just after expiry. This is observation, not an
+                    # atomic two-phase commit guarantee.
+                    for peer_side, peer_worker in self._workers.items():
+                        if peer_side == exc.side or peer_side in worker_applied_monotonic_ns:
+                            continue
+                        try:
+                            peer_state = peer_worker.latest_state(self.config.command_ack_timeout_s)
+                        except Exception:
+                            continue
+                        if peer_state.last_applied_command_sequence == command_sequence:
+                            peer_dispatch_ns = peer_state.last_dispatch_started_monotonic_ns
+                            peer_ack_ns = peer_state.last_driver_acknowledged_monotonic_ns
+                            if peer_dispatch_ns is not None:
+                                worker_dispatch_started_monotonic_ns[peer_side] = peer_dispatch_ns
+                                worker_applied_monotonic_ns[peer_side] = peer_dispatch_ns
+                            if peer_ack_ns is not None:
+                                worker_driver_acknowledged_monotonic_ns[peer_side] = peer_ack_ns
+                        if peer_state.fault is not None:
+                            worker_rejected_monotonic_ns[peer_side] = (
+                                peer_state.fault_monotonic_ns
+                                if peer_state.fault_monotonic_ns is not None
+                                else peer_state.timestamp_ns
+                            )
+                    self._last_dispatch_timing["worker_rejected_monotonic_ns"] = worker_rejected_monotonic_ns
+                    self._last_dispatch_timing["worker_applied_monotonic_ns"] = dict(
+                        worker_applied_monotonic_ns
+                    )
+                    self._last_dispatch_timing["worker_dispatch_started_monotonic_ns"] = dict(
+                        worker_dispatch_started_monotonic_ns
+                    )
+                    self._last_dispatch_timing["worker_driver_acknowledged_monotonic_ns"] = dict(
+                        worker_driver_acknowledged_monotonic_ns
+                    )
+                    raise
                 if state.last_applied_positions != commands[side].positions:
                     raise RuntimeError(f"{side} arm acknowledged different positions")
                 self._states[side] = state
-        except Exception:
+                applied_ns = state.last_applied_monotonic_ns
+                dispatch_started_ns = state.last_dispatch_started_monotonic_ns
+                driver_acknowledged_ns = state.last_driver_acknowledged_monotonic_ns
+                if expires_at_monotonic_ns is not None and (
+                    applied_ns is None or dispatch_started_ns is None or driver_acknowledged_ns is None
+                ):
+                    raise RuntimeError(f"{side} arm omitted required worker dispatch timing")
+                worker_applied_monotonic_ns[side] = state.timestamp_ns if applied_ns is None else applied_ns
+                worker_dispatch_started_monotonic_ns[side] = (
+                    state.timestamp_ns if dispatch_started_ns is None else dispatch_started_ns
+                )
+                worker_driver_acknowledged_monotonic_ns[side] = (
+                    state.timestamp_ns if driver_acknowledged_ns is None else driver_acknowledged_ns
+                )
+                self._last_dispatch_timing["worker_applied_monotonic_ns"] = dict(worker_applied_monotonic_ns)
+                self._last_dispatch_timing["worker_dispatch_started_monotonic_ns"] = dict(
+                    worker_dispatch_started_monotonic_ns
+                )
+                self._last_dispatch_timing["worker_driver_acknowledged_monotonic_ns"] = dict(
+                    worker_driver_acknowledged_monotonic_ns
+                )
+            self._last_dispatch_timing["worker_applied_monotonic_ns"] = worker_applied_monotonic_ns
+        except (Exception, KeyboardInterrupt):
             self._safe_idle_workers()
             raise
 
-        return {key: float(value) for key, value in zip(YAM_SCALAR_KEYS, applied, strict=True)}
+        return applied_action
+
+    def _validate_endpoint(self, positions: np.ndarray) -> RobotAction:
+        action = {key: float(value) for key, value in zip(YAM_SCALAR_KEYS, positions, strict=True)}
+        if self._pre_dispatch_validator is not None:
+            self._pre_dispatch_validator(MappingProxyType(action))
+        return action
 
     def disconnect(self) -> None:
         self._require_resources()
@@ -427,10 +640,11 @@ class BiYAMFollower(Robot):
             "requested": requested.tolist(),
             "bounded": bounded.tolist(),
             "applied": applied.tolist(),
-            "measured_before": measured_before.tolist(),
-            "measured_after": measured_after.tolist(),
-            "requested_tracking_error": requested_error.tolist(),
-            "applied_tracking_error": applied_error.tolist(),
+            "state_before_dispatch": measured_before.tolist(),
+            "state_at_acknowledgement": measured_after.tolist(),
+            "requested_vs_ack_state_error": requested_error.tolist(),
+            "applied_vs_ack_state_error": applied_error.tolist(),
+            "acknowledgement_confirms_achievement": False,
             "bound_clipped": bound_clipped,
             "delta_clipped": delta_clipped,
         }
@@ -444,7 +658,7 @@ class BiYAMFollower(Robot):
         interval_ns = int(self.config.control_telemetry_console_interval_s * 1e9)
         if interval_ns == 0 or timestamp_ns - self._last_control_summary_ns >= interval_ns:
             logger.info(
-                "YAM control phase=%s seq=%d max_applied_tracking_error=%.4f "
+                "YAM control phase=%s seq=%d max_applied_vs_ack_state_error=%.4f "
                 "bound_clipped=%s delta_clipped=%s",
                 phase,
                 self._command_sequence,

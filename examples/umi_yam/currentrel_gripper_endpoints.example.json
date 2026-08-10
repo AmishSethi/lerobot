@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "umi1": {
+    "closed_width_mm": 0.0,
+    "open_width_mm": 125.0,
+    "verified": false,
+    "dataset_device": "umi1",
+    "assigned_arm": "left",
+    "device_id": "REPLACE_STABLE_UMI1_SERIAL_OR_ASSET_TAG",
+    "evidence_uri": "REPLACE_IMMUTABLE_UMI1_ENDPOINT_SWEEP_EVIDENCE_URI",
+    "evidence_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "detector_config_id": "REPLACE_EXACT_DETECTOR_CONFIG_ID",
+    "detector_config_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "fisheye_calibration_id": "REPLACE_EXACT_UMI1_FISHEYE_CALIBRATION_ID",
+    "fisheye_calibration_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "geometry_config_id": "REPLACE_EXACT_TAG_GEOMETRY_CONFIG_ID",
+    "geometry_config_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "umi2": {
+    "closed_width_mm": 0.0,
+    "open_width_mm": 125.0,
+    "verified": false,
+    "dataset_device": "umi2",
+    "assigned_arm": "right",
+    "device_id": "REPLACE_STABLE_UMI2_SERIAL_OR_ASSET_TAG",
+    "evidence_uri": "REPLACE_IMMUTABLE_UMI2_ENDPOINT_SWEEP_EVIDENCE_URI",
+    "evidence_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "detector_config_id": "REPLACE_EXACT_DETECTOR_CONFIG_ID",
+    "detector_config_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "fisheye_calibration_id": "REPLACE_EXACT_UMI2_FISHEYE_CALIBRATION_ID",
+    "fisheye_calibration_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "geometry_config_id": "REPLACE_EXACT_TAG_GEOMETRY_CONFIG_ID",
+    "geometry_config_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}
