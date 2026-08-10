@@ -32,6 +32,7 @@ class PolicyServerAppConfig:
     )
     host: str = "127.0.0.1"
     port: int = 8081
+    server_revision: str = "development"
     max_message_bytes: int = 16 * 1024 * 1024
     max_image_bytes: int = 8 * 1024 * 1024
     max_decoded_image_bytes: int = 64 * 1024 * 1024
@@ -50,6 +51,7 @@ def run_server(cfg: PolicyServerAppConfig) -> None:
     server_config = RemotePolicyServerConfig(
         host=cfg.host,
         port=cfg.port,
+        server_revision=cfg.server_revision,
         max_message_bytes=cfg.max_message_bytes,
         max_image_bytes=cfg.max_image_bytes,
         max_decoded_image_bytes=cfg.max_decoded_image_bytes,

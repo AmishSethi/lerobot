@@ -3062,6 +3062,7 @@ all = [
     { name = "mock-serial", marker = "sys_platform != 'win32'" },
     { name = "motorbridge" },
     { name = "motorbridge-smart-servo" },
+    { name = "mujoco" },
     { name = "mypy" },
     { name = "num2words" },
     { name = "pandas" },
@@ -3315,6 +3316,9 @@ motorbridge-dep = [
 motorbridge-smart-servo-dep = [
     { name = "motorbridge-smart-servo" },
 ]
+mujoco-dep = [
+    { name = "mujoco" },
+]
 multi-task-dit = [
     { name = "diffusers" },
     { name = "transformers" },
@@ -3435,6 +3439,25 @@ training = [
 transformers-dep = [
     { name = "transformers" },
 ]
+umi-yam = [
+    { name = "cmeel-tinyxml2" },
+    { name = "cmeel-urdfdom" },
+    { name = "grpcio" },
+    { name = "i2rt" },
+    { name = "placo" },
+    { name = "protobuf" },
+    { name = "scipy" },
+]
+umi-yam-rig = [
+    { name = "cmeel-tinyxml2" },
+    { name = "cmeel-urdfdom" },
+    { name = "grpcio" },
+    { name = "i2rt" },
+    { name = "mujoco" },
+    { name = "placo" },
+    { name = "protobuf" },
+    { name = "scipy" },
+]
 unitree-g1 = [
     { name = "contourpy" },
     { name = "matplotlib" },
@@ -3513,6 +3536,7 @@ requires-dist = [
     { name = "lerobot", extras = ["av-dep"], marker = "extra == 'dataset'" },
     { name = "lerobot", extras = ["av-dep"], marker = "extra == 'evaluation'" },
     { name = "lerobot", extras = ["bi-yam"], marker = "extra == 'all'" },
+    { name = "lerobot", extras = ["bi-yam"], marker = "extra == 'umi-yam'" },
     { name = "lerobot", extras = ["can-dep"], marker = "extra == 'damiao'" },
     { name = "lerobot", extras = ["can-dep"], marker = "extra == 'robstride'" },
     { name = "lerobot", extras = ["damiao"], marker = "extra == 'all'" },
@@ -3557,6 +3581,7 @@ requires-dist = [
     { name = "lerobot", extras = ["hopejr"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["intelrealsense"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["kinematics"], marker = "extra == 'all'" },
+    { name = "lerobot", extras = ["kinematics"], marker = "extra == 'umi-yam'" },
     { name = "lerobot", extras = ["lekiwi"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["libero"], marker = "sys_platform == 'linux' and extra == 'all'" },
     { name = "lerobot", extras = ["lingbot-va"], marker = "extra == 'all'" },
@@ -3567,6 +3592,7 @@ requires-dist = [
     { name = "lerobot", extras = ["molmoact2"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["motorbridge-dep"], marker = "extra == 'rebot'" },
     { name = "lerobot", extras = ["motorbridge-smart-servo-dep"], marker = "extra == 'rebot'" },
+    { name = "lerobot", extras = ["mujoco-dep"], marker = "extra == 'umi-yam-rig'" },
     { name = "lerobot", extras = ["multi-task-dit"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["notebook"], marker = "extra == 'dev'" },
     { name = "lerobot", extras = ["openarms"], marker = "extra == 'all'" },
@@ -3599,6 +3625,7 @@ requires-dist = [
     { name = "lerobot", extras = ["reachy2"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["rebot"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["remote"], marker = "extra == 'all'" },
+    { name = "lerobot", extras = ["remote"], marker = "extra == 'umi-yam'" },
     { name = "lerobot", extras = ["robometer"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["robstride"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["sarm"], marker = "extra == 'all'" },
@@ -3608,6 +3635,7 @@ requires-dist = [
     { name = "lerobot", extras = ["scipy-dep"], marker = "extra == 'molmoact2'" },
     { name = "lerobot", extras = ["scipy-dep"], marker = "extra == 'phone'" },
     { name = "lerobot", extras = ["scipy-dep"], marker = "extra == 'pi'" },
+    { name = "lerobot", extras = ["scipy-dep"], marker = "extra == 'umi-yam'" },
     { name = "lerobot", extras = ["scipy-dep"], marker = "extra == 'wallx'" },
     { name = "lerobot", extras = ["smolvla"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["test"], marker = "extra == 'all'" },
@@ -3633,6 +3661,9 @@ requires-dist = [
     { name = "lerobot", extras = ["transformers-dep"], marker = "extra == 'vla-jepa'" },
     { name = "lerobot", extras = ["transformers-dep"], marker = "extra == 'wallx'" },
     { name = "lerobot", extras = ["transformers-dep"], marker = "extra == 'xvla'" },
+    { name = "lerobot", extras = ["umi-yam"], marker = "extra == 'all'" },
+    { name = "lerobot", extras = ["umi-yam"], marker = "extra == 'umi-yam-rig'" },
+    { name = "lerobot", extras = ["umi-yam-rig"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["video-benchmark"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["viz"], marker = "extra == 'all'" },
     { name = "lerobot", extras = ["viz"], marker = "extra == 'core-scripts'" },
@@ -3646,6 +3677,7 @@ requires-dist = [
     { name = "mock-serial", marker = "sys_platform != 'win32' and extra == 'test'", specifier = ">=0.0.1,<0.1.0" },
     { name = "motorbridge", marker = "extra == 'motorbridge-dep'", specifier = ">=0.3.2,<0.4.0" },
     { name = "motorbridge-smart-servo", marker = "extra == 'motorbridge-smart-servo-dep'", specifier = ">=0.0.4,<0.1.0" },
+    { name = "mujoco", marker = "extra == 'mujoco-dep'", specifier = ">=3.3.0,<4.0.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.19.1" },
     { name = "num2words", marker = "extra == 'smolvla'", specifier = ">=0.5.14,<0.6.0" },
     { name = "numpy", specifier = ">=2.0.0,<2.3.0" },
@@ -3703,7 +3735,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'transformers-dep'", specifier = ">=5.4.0,<5.6.0" },
     { name = "wandb", marker = "extra == 'training'", specifier = ">=0.24.0,<0.28.0" },
 ]
-provides-extras = ["dataset", "training", "hardware", "viz", "core-scripts", "evaluation", "dataset-viz", "av-dep", "pygame-dep", "placo-dep", "transformers-dep", "grpcio-dep", "accelerate-dep", "can-dep", "peft-dep", "scipy-dep", "diffusers-dep", "qwen-vl-utils-dep", "matplotlib-dep", "pyserial-dep", "deepdiff-dep", "pynput-dep", "pyzmq-dep", "motorbridge-dep", "motorbridge-smart-servo-dep", "timm-dep", "feetech", "dynamixel", "damiao", "robstride", "openarms", "gamepad", "hopejr", "lekiwi", "unitree-g1", "reachy2", "rebot", "bi-yam", "kinematics", "intelrealsense", "phone", "diffusion", "wallx", "pi", "molmoact2", "smolvla", "multi-task-dit", "groot", "sarm", "robometer", "topreward", "xvla", "eo1", "fastwam", "evo1", "hilserl", "vla-jepa", "lingbot-va", "async", "remote", "peft", "annotations", "dev", "notebook", "test", "video-benchmark", "aloha", "pusht", "libero", "metaworld", "all"]
+provides-extras = ["dataset", "training", "hardware", "viz", "core-scripts", "evaluation", "dataset-viz", "av-dep", "pygame-dep", "placo-dep", "transformers-dep", "grpcio-dep", "accelerate-dep", "can-dep", "peft-dep", "scipy-dep", "mujoco-dep", "diffusers-dep", "qwen-vl-utils-dep", "matplotlib-dep", "pyserial-dep", "deepdiff-dep", "pynput-dep", "pyzmq-dep", "motorbridge-dep", "motorbridge-smart-servo-dep", "timm-dep", "feetech", "dynamixel", "damiao", "robstride", "openarms", "gamepad", "hopejr", "lekiwi", "unitree-g1", "reachy2", "rebot", "bi-yam", "kinematics", "umi-yam", "umi-yam-rig", "intelrealsense", "phone", "diffusion", "wallx", "pi", "molmoact2", "smolvla", "multi-task-dit", "groot", "sarm", "robometer", "topreward", "xvla", "eo1", "fastwam", "evo1", "hilserl", "vla-jepa", "lingbot-va", "async", "remote", "peft", "annotations", "dev", "notebook", "test", "video-benchmark", "aloha", "pusht", "libero", "metaworld", "all"]
 
 [[package]]
 name = "lgpio"

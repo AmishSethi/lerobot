@@ -46,6 +46,7 @@ class ArmCommand:
     sequence: int
     execute_at_ns: int
     positions: tuple[float, ...]
+    expires_at_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,19 @@ class ArmState:
     last_applied_positions: tuple[float, ...] | None
     gripper_limits: tuple[float, float] | None = None
     fault: str | None = None
+    last_applied_monotonic_ns: int | None = None
+    fault_monotonic_ns: int | None = None
+    last_dispatch_started_monotonic_ns: int | None = None
+    last_driver_acknowledged_monotonic_ns: int | None = None
+
+
+class ArmCommandError(RuntimeError):
+    """Worker rejected a command, retaining the local rejection timestamp."""
+
+    def __init__(self, side: str, state: ArmState):
+        super().__init__(f"{side} arm command failed: {state.fault}")
+        self.side = side
+        self.state = state
 
 
 class ArmWorker(Protocol):
@@ -233,18 +247,29 @@ def _read_gripper_limits(backend: ArmBackend) -> tuple[float, float] | None:
 class ArmWorkerRuntime:
     """State machine executed inside exactly one arm-owning process."""
 
-    def __init__(self, backend: ArmBackend, command_ttl_s: float):
+    def __init__(
+        self,
+        backend: ArmBackend,
+        command_ttl_s: float,
+        *,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
+    ):
         self._backend = backend
         self._command_ttl_ns = int(command_ttl_s * 1e9)
+        self._monotonic_ns = monotonic_ns
         self._state_sequence = 0
         self._control_sequence = -1
         self._last_applied_sequence = -1
         self._last_applied_positions: tuple[float, ...] | None = None
+        self._last_applied_monotonic_ns: int | None = None
+        self._last_dispatch_started_monotonic_ns: int | None = None
+        self._last_driver_acknowledged_monotonic_ns: int | None = None
         self._last_command_ns: int | None = None
         self._pending_command: ArmCommand | None = None
         self._armed = False
         self._idle = True
         self._fault: str | None = None
+        self._fault_monotonic_ns: int | None = None
         self._closed = False
 
         if self._backend.num_dofs() != 7:
@@ -261,6 +286,7 @@ class ArmWorkerRuntime:
             self._last_command_ns = None
             self._pending_command = None
             self._fault = None
+            self._fault_monotonic_ns = None
         elif control.operation == "idle":
             self._pending_command = None
             self._armed = False
@@ -275,34 +301,61 @@ class ArmWorkerRuntime:
 
     def tick(self, now_ns: int) -> ArmState:
         command = self._pending_command
+        snapshot_ns = now_ns
         if command is not None and self._armed and now_ns >= command.execute_at_ns:
             self._pending_command = None
             try:
                 positions = np.asarray(command.positions, dtype=np.float64)
                 if positions.shape != (7,) or not np.isfinite(positions).all():
                     raise ValueError("command must contain seven finite positions")
-                self._backend.command_joint_pos(positions)
+                # Re-read the worker-local monotonic clock immediately before the
+                # hardware call. Equality is intentionally accepted. This is the
+                # final boundary after queueing, scheduling, and validation.
+                dispatch_started_ns = self._monotonic_ns()
+                snapshot_ns = max(snapshot_ns, dispatch_started_ns)
+                if command.expires_at_ns is not None and dispatch_started_ns > command.expires_at_ns:
+                    self._fault = "command_expired_before_worker_dispatch"
+                    self._fault_monotonic_ns = dispatch_started_ns
+                    self._armed = False
+                    self._enter_idle()
+                else:
+                    self._backend.command_joint_pos(positions)
+                    driver_acknowledged_ns = self._monotonic_ns()
+                    snapshot_ns = max(snapshot_ns, driver_acknowledged_ns)
+                    self._last_applied_sequence = command.sequence
+                    self._last_applied_positions = tuple(float(value) for value in positions)
+                    self._last_dispatch_started_monotonic_ns = dispatch_started_ns
+                    self._last_driver_acknowledged_monotonic_ns = driver_acknowledged_ns
+                    # Kept as an additive compatibility alias for the actual
+                    # pre-driver-call dispatch boundary.
+                    self._last_applied_monotonic_ns = dispatch_started_ns
+                    self._last_command_ns = driver_acknowledged_ns
+                    if command.expires_at_ns is not None and driver_acknowledged_ns > command.expires_at_ns:
+                        self._fault = "command_acknowledged_after_expiry"
+                        self._fault_monotonic_ns = driver_acknowledged_ns
+                        self._armed = False
+                        self._enter_idle()
+                    else:
+                        self._idle = False
             except Exception as exc:
                 self._fault = f"invalid_or_failed_command: {type(exc).__name__}: {exc}"
+                self._fault_monotonic_ns = self._monotonic_ns()
+                snapshot_ns = max(snapshot_ns, self._fault_monotonic_ns)
                 self._armed = False
                 self._enter_idle()
-            else:
-                self._last_applied_sequence = command.sequence
-                self._last_applied_positions = tuple(float(value) for value in positions)
-                self._last_command_ns = now_ns
-                self._idle = False
 
         if (
             self._armed
             and self._last_command_ns is not None
-            and now_ns - self._last_command_ns > self._command_ttl_ns
+            and snapshot_ns - self._last_command_ns > self._command_ttl_ns
         ):
             self._fault = "command_ttl_expired"
+            self._fault_monotonic_ns = snapshot_ns
             self._armed = False
             self._pending_command = None
             self._enter_idle()
 
-        return self.snapshot(now_ns)
+        return self.snapshot(snapshot_ns)
 
     def snapshot(self, now_ns: int) -> ArmState:
         positions = np.asarray(self._backend.get_joint_pos(), dtype=np.float64)
@@ -321,6 +374,10 @@ class ArmWorkerRuntime:
             last_applied_positions=self._last_applied_positions,
             gripper_limits=self._gripper_limits,
             fault=self._fault,
+            last_applied_monotonic_ns=self._last_applied_monotonic_ns,
+            fault_monotonic_ns=self._fault_monotonic_ns,
+            last_dispatch_started_monotonic_ns=self._last_dispatch_started_monotonic_ns,
+            last_driver_acknowledged_monotonic_ns=self._last_driver_acknowledged_monotonic_ns,
         )
 
     def close(self) -> None:
@@ -497,7 +554,7 @@ class ProcessArmWorker:
             timeout_s,
         )
         if state.fault is not None:
-            raise RuntimeError(f"{self.side} arm command failed: {state.fault}")
+            raise ArmCommandError(self.side, state)
         if state.last_applied_command_sequence != sequence:
             raise RuntimeError(
                 f"{self.side} arm acknowledged command {state.last_applied_command_sequence}, expected {sequence}"

@@ -1,0 +1,87 @@
+# EXPERIMENTAL original-data Pi0.5 onset-v3 trial. Use only the reviewed
+# explicit-noise server and keep confirm_hardware_control=false through preflight.
+robot:
+  id: REPLACE_BIYAM_ID
+  calibration_dir: /path/to/read-only/calibration/robots/bi_yam_follower
+  left_arm_config:
+    adapter_serial: REPLACE_LEFT_CAN_ADAPTER_SERIAL
+    arm_type: yam
+    gripper_type: linear_4310
+    allow_gripper_calibration: false
+    command_ttl_s: 1.0
+  right_arm_config:
+    adapter_serial: REPLACE_RIGHT_CAN_ADAPTER_SERIAL
+    arm_type: yam
+    gripper_type: linear_4310
+    allow_gripper_calibration: false
+    command_ttl_s: 1.0
+  cameras:
+    left_wrist:
+      type: opencv
+      index_or_path: /dev/v4l/by-id/REPLACE_LEFT_WRIST_CAMERA
+      fps: 30
+      width: 800
+      height: 600
+      fourcc: MJPG
+    right_wrist:
+      type: opencv
+      index_or_path: /dev/v4l/by-id/REPLACE_RIGHT_WRIST_CAMERA
+      fps: 30
+      width: 800
+      height: 600
+      fourcc: MJPG
+  max_joint_delta: 0.1
+  max_gripper_delta: 0.03
+  policy_start_position: [0, 0.05, 0.05, 0, 0, 0, 1, 0, 0.05, 0.05, 0, 0, 0, 1]
+  policy_reset_step_size: 0.01
+  policy_reset_max_steps: 900
+  policy_reset_fps: 30
+  policy_reset_tolerance: 0.035
+  policy_reset_timeout_s: 30
+
+server_address: 127.0.0.1:8081
+urdf: /path/to/read-only/trusted/yam.urdf
+left_camera_key: left_wrist
+right_camera_key: right_wrist
+telemetry_path: /path/to/fresh/pi05-onset-v3-trial.jsonl
+gripper_calibration_json: /path/to/read-only/verified/currentrel_gripper_endpoints.json
+max_steps: 1
+expected_model_id: /path/to/read-only/pi05-onset-v3-12k/pretrained_model
+expected_model_revision: main
+expected_policy_type: pi05
+expected_model_fingerprint: "0000000000000000000000000000000000000000000000000000000000000000"
+expected_command_ttl_ms: 1000
+worker_dispatch_expiry_margin_s: 0.05
+expected_server_revision: REPLACE_IMMUTABLE_SERVER_REVISION
+expected_server_config_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+expected_model_artifact_tree_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+expected_model_artifact_manifest_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+expected_runtime_dependency_tree_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+expected_runtime_dependency_manifest_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+# Seed 0 is only an example. Replace this and the service identity together with
+# the reviewed seed selected from the frozen 0..4 gate.
+expected_server_service_name: lerobot-pi05-onset-v3-explicit-noise-seed-0
+expected_pi_eval_seed: 0
+expected_inference_code_manifest_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+expected_inference_attestation_identity_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+onset_v3_gate_plan: /path/to/read-only/onset_v3_checkpoint_gate.json
+expected_onset_v3_gate_plan_sha256: f5841191715930db0c9edd29aa96cc45971fe1f36460c70e03f40e596ccd4d36
+expected_gripper_calibration_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+hardware_commissioning_evidence: null
+expected_hardware_commissioning_evidence_sha256: ""
+task: Put all oranges in the bowl
+control_hz: 30
+execution_horizon: 15
+max_joint_delta_per_call: 0.02
+max_gripper_delta_per_call: 0.03
+progress_position_tolerance_m: 0.003
+progress_orientation_tolerance_rad: 0.03490658503988659
+progress_gripper_tolerance: 0.02
+max_progress_hold_steps: 90
+max_inference_latency_s: 20
+max_inference_hold_joint_drift: 0.01
+max_inference_hold_gripper_drift: 0.002
+rig_calibration_json: /path/to/read-only/verified/bi_yam_rig.json
+minimum_clearance_m: 0.01
+confirm_hardware_control: false
+reset_after_policy: false

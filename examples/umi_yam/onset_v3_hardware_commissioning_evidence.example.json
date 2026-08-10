@@ -1,0 +1,62 @@
+{
+  "schema_id": "umi-yam-onset-v3-hardware-commissioning-evidence-v1",
+  "commissioning_passed": false,
+  "robot": {
+    "robot_id": "REPLACE_BIYAM_ID",
+    "left_arm_id": "REPLACE_PHYSICAL_LEFT_ARM_ID",
+    "right_arm_id": "REPLACE_PHYSICAL_RIGHT_ARM_ID",
+    "left_adapter_serial": "REPLACE_LEFT_CAN_ADAPTER_SERIAL",
+    "right_adapter_serial": "REPLACE_RIGHT_CAN_ADAPTER_SERIAL"
+  },
+  "fixed_global_start_anchor": {
+    "joint_units": "radians",
+    "left_arm_joint_radians": [0.0, 0.05, 0.05, 0.0, 0.0, 0.0],
+    "left_gripper_yam": 1.0,
+    "left_gripper_calibrated_umi": -999.0,
+    "left_gripper_training_support": [0.4486217200756073, 1.0],
+    "right_arm_joint_radians": [0.0, 0.05, 0.05, 0.0, 0.0, 0.0],
+    "right_gripper_yam": 1.0,
+    "right_gripper_calibrated_umi": -999.0,
+    "right_gripper_training_support": [0.5472135543823242, 0.9483147859573364]
+  },
+  "calibrations": {
+    "bi_yam_path": "/absolute/read-only/path/to/REPLACE_BIYAM_ID.json",
+    "bi_yam_sha256": "REPLACE_LOWERCASE_SHA256",
+    "gripper_endpoints_path": "/absolute/read-only/path/to/currentrel_gripper_endpoints.json",
+    "gripper_endpoints_sha256": "REPLACE_LOWERCASE_SHA256",
+    "rig_table_path": "/absolute/read-only/path/to/bi_yam_rig.json",
+    "rig_table_sha256": "REPLACE_LOWERCASE_SHA256"
+  },
+  "cameras": {
+    "left": {
+      "camera_key": "left_wrist",
+      "stable_device_id": "/dev/v4l/by-id/REPLACE_LEFT_WRIST_CAMERA",
+      "training_viewpoint_verified": false,
+      "training_viewpoint_evidence_path": "/absolute/read-only/path/to/left_viewpoint_evidence.json",
+      "training_viewpoint_evidence_size_bytes": 0,
+      "training_viewpoint_evidence_sha256": "REPLACE_LOWERCASE_SHA256"
+    },
+    "right": {
+      "camera_key": "right_wrist",
+      "stable_device_id": "/dev/v4l/by-id/REPLACE_RIGHT_WRIST_CAMERA",
+      "training_viewpoint_verified": false,
+      "training_viewpoint_evidence_path": "/absolute/read-only/path/to/right_viewpoint_evidence.json",
+      "training_viewpoint_evidence_size_bytes": 0,
+      "training_viewpoint_evidence_sha256": "REPLACE_LOWERCASE_SHA256"
+    }
+  },
+  "measured_reset": {
+    "passed": false,
+    "trial_count": 0,
+    "joint_tolerance_radians": 0.035,
+    "gripper_tolerance_normalized": 0.035,
+    "left_max_abs_joint_error_radians": 999.0,
+    "right_max_abs_joint_error_radians": 999.0,
+    "left_gripper_abs_error_normalized": 999.0,
+    "right_gripper_abs_error_normalized": 999.0,
+    "measurement_id": "REPLACE_PHYSICAL_RESET_MEASUREMENT_ID",
+    "evidence_path": "/absolute/read-only/path/to/measured_reset_evidence.json",
+    "evidence_size_bytes": 0,
+    "evidence_sha256": "REPLACE_LOWERCASE_SHA256"
+  }
+}

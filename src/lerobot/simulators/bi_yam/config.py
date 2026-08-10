@@ -52,6 +52,7 @@ class BiYAMSimulatorConfig:
     right_base_position: tuple[float, float, float] = (0.32, 0.0, 0.4)
     left_base_quaternion: tuple[float, float, float, float] = (0.7071068, 0.0, 0.0, 0.7071068)
     right_base_quaternion: tuple[float, float, float, float] = (0.7071068, 0.0, 0.0, -0.7071068)
+    include_workspace_objects: bool = True
     fallback_position_gain: float = 80.0
     fallback_damping: float = 18.0
     mujoco_arm_kp: float = 80.0

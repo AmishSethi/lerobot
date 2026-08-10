@@ -76,14 +76,14 @@ class MujocoBiYAMBackend(_StepDrivenBiYAMBackend):
 
     def _read_state(self) -> np.ndarray:
         state = np.asarray(self._data.qpos[self._joint_qpos_addresses], dtype=np.float32).copy()
-        state[[6, 13]] /= _GRIPPER_TRAVEL_METERS
+        state[[6, 13]] = 1.0 - state[[6, 13]] / _GRIPPER_TRAVEL_METERS
         return state
 
     def _set_control_target(self, target: np.ndarray) -> None:
         if self._data is None:
             return
         controls = target.astype(np.float64, copy=True)
-        controls[[6, 13]] *= _GRIPPER_TRAVEL_METERS
+        controls[[6, 13]] = (1.0 - controls[[6, 13]]) * _GRIPPER_TRAVEL_METERS
         self._data.ctrl[self._actuator_ids] = controls
 
     def _step_physics(self, stuck_positions: dict[int, float]) -> None:
@@ -91,7 +91,7 @@ class MujocoBiYAMBackend(_StepDrivenBiYAMBackend):
         if not stuck_positions:
             return
         for index, position in stuck_positions.items():
-            physical_position = position * _GRIPPER_TRAVEL_METERS if index in (6, 13) else position
+            physical_position = (1.0 - position) * _GRIPPER_TRAVEL_METERS if index in (6, 13) else position
             self._data.qpos[self._joint_qpos_addresses[index]] = physical_position
             self._data.qvel[self._joint_dof_addresses[index]] = 0.0
             if index in (6, 13):
@@ -119,7 +119,7 @@ class MujocoBiYAMBackend(_StepDrivenBiYAMBackend):
 
     def _write_command_state(self, state: np.ndarray) -> None:
         physical = state.astype(np.float64, copy=True)
-        physical[[6, 13]] *= _GRIPPER_TRAVEL_METERS
+        physical[[6, 13]] = (1.0 - physical[[6, 13]]) * _GRIPPER_TRAVEL_METERS
         self._data.qpos[self._joint_qpos_addresses] = physical
         for side_index, state_index in enumerate((6, 13)):
             self._data.qpos[self._gripper_secondary_qpos_addresses[side_index]] = physical[state_index]
@@ -146,7 +146,46 @@ class MujocoBiYAMBackend(_StepDrivenBiYAMBackend):
             raise RuntimeError(f"Generated MuJoCo world is missing {name!r}")
         return object_id
 
-    def _build_world_xml(self, seed: int) -> str:
+    def build_collision_world_xml(
+        self,
+        *,
+        table_point_in_left_base: tuple[float, float, float],
+        table_normal_toward_workspace: tuple[float, float, float],
+        minimum_clearance_m: float = 0.0,
+    ) -> str:
+        """Build a task-object-free world for calibrated rig collision checks.
+
+        The left YAM base is the world frame. Base poses still come from
+        ``self.config``; callers are responsible for constructing that config
+        from a measured rig transform. The table is represented only by its
+        measured top plane, so task objects and guessed table dimensions cannot
+        influence the result.
+        """
+
+        point = np.asarray(table_point_in_left_base, dtype=np.float64)
+        normal = np.asarray(table_normal_toward_workspace, dtype=np.float64)
+        if point.shape != (3,) or normal.shape != (3,):
+            raise ValueError("table point and normal must each have shape (3,)")
+        if not np.isfinite(point).all() or not np.isfinite(normal).all():
+            raise ValueError("table point and normal must be finite")
+        norm = float(np.linalg.norm(normal))
+        if norm <= 1e-12:
+            raise ValueError("table normal must be nonzero")
+        if not np.isfinite(minimum_clearance_m) or minimum_clearance_m < 0:
+            raise ValueError("minimum_clearance_m must be finite and non-negative")
+        return self._build_world_xml(
+            seed=0,
+            collision_table_plane=(point, normal / norm),
+            collision_margin_m=float(minimum_clearance_m),
+        )
+
+    def _build_world_xml(
+        self,
+        seed: int,
+        *,
+        collision_table_plane: tuple[np.ndarray, np.ndarray] | None = None,
+        collision_margin_m: float = 0.0,
+    ) -> str:
         source_root = self._load_i2rt_robot_xml()
         root = ET.Element("mujoco", {"model": "bi_yam"})
         ET.SubElement(root, "compiler", {"angle": "radian", "autolimits": "true"})
@@ -173,7 +212,10 @@ class MujocoBiYAMBackend(_StepDrivenBiYAMBackend):
         root.append(deepcopy(source_assets))
 
         worldbody = ET.SubElement(root, "worldbody")
-        self._add_workspace(worldbody, seed)
+        if collision_table_plane is None:
+            self._add_workspace(worldbody, seed)
+        else:
+            self._add_calibrated_table_plane(worldbody, *collision_table_plane, collision_margin_m)
 
         source_worldbody = source_root.find("worldbody")
         if source_worldbody is None:
@@ -191,12 +233,53 @@ class MujocoBiYAMBackend(_StepDrivenBiYAMBackend):
             arm_body.set("pos", _numbers(position))
             arm_body.set("quat", _numbers(quaternion))
             self._configure_robot_joints(arm_body)
+            if collision_table_plane is not None:
+                self._set_collision_margin(arm_body, collision_margin_m)
             worldbody.append(arm_body)
 
         self._copy_per_arm_section(source_root, root, "equality")
         self._copy_per_arm_section(source_root, root, "contact")
+        self._add_base_contact_excludes(root)
         self._add_actuators(root)
         return ET.tostring(root, encoding="unicode")
+
+    @staticmethod
+    def _add_calibrated_table_plane(
+        worldbody: ET.Element,
+        point: np.ndarray,
+        normal: np.ndarray,
+        collision_margin_m: float,
+    ) -> None:
+        """Add an infinite tabletop whose +Z side is the free workspace."""
+
+        z_axis = np.asarray((0.0, 0.0, 1.0), dtype=np.float64)
+        cosine = float(np.clip(np.dot(z_axis, normal), -1.0, 1.0))
+        if cosine < -1.0 + 1e-12:
+            quaternion = np.asarray((0.0, 1.0, 0.0, 0.0), dtype=np.float64)
+        else:
+            cross = np.cross(z_axis, normal)
+            scalar = np.sqrt(2.0 * (1.0 + cosine))
+            quaternion = np.concatenate(((0.5 * scalar,), cross / scalar))
+
+        ET.SubElement(
+            worldbody,
+            "geom",
+            {
+                "name": "calibrated_table_plane",
+                "type": "plane",
+                "pos": _numbers(tuple(float(value) for value in point)),
+                "quat": _numbers(tuple(float(value) for value in quaternion)),
+                "size": "0 0 0.1",
+                "margin": str(collision_margin_m),
+                "rgba": "0.48 0.43 0.35 0.3",
+            },
+        )
+
+    @staticmethod
+    def _set_collision_margin(arm_body: ET.Element, minimum_clearance_m: float) -> None:
+        for geom in arm_body.iter("geom"):
+            existing_margin = float(geom.get("margin", "0"))
+            geom.set("margin", str(max(existing_margin, minimum_clearance_m)))
 
     @staticmethod
     def _load_i2rt_robot_xml() -> ET.Element:
@@ -264,6 +347,24 @@ class MujocoBiYAMBackend(_StepDrivenBiYAMBackend):
         for side in ("left", "right"):
             for child in source:
                 target.append(_prefix_references(child, f"{side}_"))
+
+    @staticmethod
+    def _add_base_contact_excludes(root: ET.Element) -> None:
+        """Exclude the overlapping collision meshes on each arm's first joint."""
+
+        contact = root.find("contact")
+        if contact is None:
+            contact = ET.SubElement(root, "contact")
+        for side in ("left", "right"):
+            ET.SubElement(
+                contact,
+                "exclude",
+                {
+                    "name": f"{side}_base_link1",
+                    "body1": f"{side}_base",
+                    "body2": f"{side}_link1",
+                },
+            )
 
     def _add_actuators(self, root: ET.Element) -> None:
         actuator = ET.SubElement(root, "actuator")
@@ -334,6 +435,9 @@ class MujocoBiYAMBackend(_StepDrivenBiYAMBackend):
                 "camera",
                 {"name": name, "mode": "fixed", "pos": position, "xyaxes": axes, "fovy": "58"},
             )
+
+        if not self.config.include_workspace_objects:
+            return
 
         rng = np.random.default_rng(seed)
         object_specs = (

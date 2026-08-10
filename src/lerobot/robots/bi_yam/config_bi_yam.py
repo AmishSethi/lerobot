@@ -31,19 +31,27 @@ YAM_SCALAR_KEYS = (
 )
 
 BI_YAM_POLICY_END_POSITION = (*([0.0] * 6), 1.0, *([0.0] * 6), 1.0)
+# Collaborator-specified rollout reset; optimizer provenance still needs to prove
+# that this start is compatible with the filtered Cartesian trajectories.
 BI_YAM_POLICY_START_POSITION = BI_YAM_POLICY_END_POSITION
+
+# Authoritative default operational limits for the six YAM arm joints. Physical
+# deployments may configure tighter per-arm ranges on ``BiYAMFollowerConfig``;
+# callers must pass those configured ranges through to IK rather than falling
+# back to this model-wide default.
+YAM_JOINT_LIMITS: tuple[tuple[float, float], ...] = (
+    (-2.61799, 3.14159),
+    (0.0, 3.66519),
+    (0.0, 3.14159),
+    (-1.69297, 1.5708),
+    (-1.5708, 1.5708),
+    (-2.0944, 2.0944),
+)
 
 
 def _default_joint_limits() -> list[tuple[float, float]]:
     # Operational limits match the YAM model limits without i2rt's hardware-level buffer.
-    return [
-        (-2.61799, 3.14159),
-        (0.0, 3.66519),
-        (0.0, 3.14159),
-        (-1.69297, 1.5708),
-        (-1.5708, 1.5708),
-        (-2.0944, 2.0944),
-    ]
+    return list(YAM_JOINT_LIMITS)
 
 
 def _validate_limits(name: str, limits: list[tuple[float, float]], expected: int) -> None:
@@ -55,6 +63,23 @@ def _validate_limits(name: str, limits: list[tuple[float, float]], expected: int
         lower, upper = pair
         if not math.isfinite(lower) or not math.isfinite(upper) or lower >= upper:
             raise ValueError(f"{name}[{index}] must be a finite, increasing interval")
+
+
+def _validate_operational_joint_limits(
+    name: str,
+    limits: list[tuple[float, float]],
+) -> None:
+    """Require configured ranges to tighten, never widen, trusted YAM limits."""
+
+    _validate_limits(name, limits, len(YAM_JOINT_LIMITS))
+    for index, ((lower, upper), (trusted_lower, trusted_upper)) in enumerate(
+        zip(limits, YAM_JOINT_LIMITS, strict=True)
+    ):
+        if lower < trusted_lower or upper > trusted_upper:
+            raise ValueError(
+                f"{name}[{index}] must stay within authoritative YAM limits "
+                f"[{trusted_lower}, {trusted_upper}]"
+            )
 
 
 def _validate_raw_gripper_limits(name: str, limits: tuple[float, float]) -> None:
@@ -161,7 +186,10 @@ class BiYAMFollowerConfig(RobotConfig):
     # A configured pose is reached before policy control and between policy episodes.
     policy_start_position: tuple[float, ...] | None = BI_YAM_POLICY_START_POSITION
     policy_reset_step_size: float = 0.01
-    policy_reset_max_steps: int = 100
+    # At the default 30 Hz/30 s this permits the full timeout budget. A measured-
+    # progress reset may need more than 100 calls to traverse a valid multi-radian
+    # joint range at the conservative 0.01-position step.
+    policy_reset_max_steps: int = 900
     policy_reset_fps: float = 30.0
     policy_reset_tolerance: float = 0.035
     policy_reset_timeout_s: float = 30.0
@@ -220,8 +248,8 @@ class BiYAMFollowerConfig(RobotConfig):
         if self.policy_reset_max_steps <= 0:
             raise ValueError("policy_reset_max_steps must be positive")
 
-        _validate_limits("left_joint_limits", self.left_joint_limits, 6)
-        _validate_limits("right_joint_limits", self.right_joint_limits, 6)
+        _validate_operational_joint_limits("left_joint_limits", self.left_joint_limits)
+        _validate_operational_joint_limits("right_joint_limits", self.right_joint_limits)
         _validate_limits("gripper_limits", [self.gripper_limits], 1)
 
         if self.policy_start_position is not None:
@@ -248,5 +276,27 @@ class BiYAMFollowerConfig(RobotConfig):
             if out_of_bounds:
                 raise ValueError(
                     "policy_start_position is outside operational limits for " + ", ".join(out_of_bounds)
+                )
+            driver_caps = [
+                *([self.max_joint_delta] * 6),
+                self.max_gripper_delta,
+                *([self.max_joint_delta] * 6),
+                self.max_gripper_delta,
+            ]
+            ideal_reset_steps = max(
+                math.ceil(
+                    max(
+                        0.0,
+                        max(abs(value - lower), abs(value - upper)) - self.policy_reset_tolerance,
+                    )
+                    / min(self.policy_reset_step_size, driver_cap)
+                )
+                for value, (lower, upper), driver_cap in zip(values, limits, driver_caps, strict=True)
+            )
+            if self.policy_reset_max_steps < ideal_reset_steps:
+                raise ValueError(
+                    "policy_reset_max_steps cannot reach policy_start_position from the full "
+                    "operational range at the effective driver-clipped reset step; "
+                    f"need at least {ideal_reset_steps}"
                 )
             self.policy_start_position = values

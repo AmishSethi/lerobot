@@ -133,6 +133,16 @@ class ModelManifest:
     action_features: tuple[str, ...]
     camera_keys: tuple[str, ...]
     fingerprint: str
+    gripper_action_representation: str = ""
+    artifact_tree_sha256: str = ""
+    artifact_manifest_sha256: str = ""
+    ik_release_report_sha256: str = ""
+    runtime_dependency_tree_sha256: str = ""
+    runtime_dependency_manifest_sha256: str = ""
+    inference_backend_mode: str = ""
+    inference_seed: int = 0
+    inference_code_manifest_sha256: str = ""
+    inference_attestation_identity_sha256: str = ""
 
     def validate(self) -> None:
         if not self.model_id or not self.policy_type or not self.fingerprint:
@@ -144,6 +154,40 @@ class ModelManifest:
         _require_unique(self.camera_keys, "model camera_keys")
         if len(self.action_features) != self.action_dim:
             raise ProtocolValidationError("model action feature count does not match action_dim")
+        if self.gripper_action_representation != self.gripper_action_representation.strip():
+            raise ProtocolValidationError("model gripper action representation must be trimmed")
+        if self.inference_backend_mode != self.inference_backend_mode.strip():
+            raise ProtocolValidationError("model inference backend mode must be trimmed")
+        if isinstance(self.inference_seed, bool) or not isinstance(self.inference_seed, int):
+            raise ProtocolValidationError("model inference seed must be an integer")
+        if self.inference_seed < 0:
+            raise ProtocolValidationError("model inference seed must be non-negative")
+        for name in (
+            "artifact_tree_sha256",
+            "artifact_manifest_sha256",
+            "ik_release_report_sha256",
+            "runtime_dependency_tree_sha256",
+            "runtime_dependency_manifest_sha256",
+            "inference_code_manifest_sha256",
+            "inference_attestation_identity_sha256",
+        ):
+            value = getattr(self, name)
+            if value and (
+                len(value) != 64
+                or value != value.lower()
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ProtocolValidationError(f"model {name} must be a lowercase SHA-256 digest")
+        if bool(self.runtime_dependency_tree_sha256) != bool(self.runtime_dependency_manifest_sha256):
+            raise ProtocolValidationError("model runtime dependency tree and manifest digests must be paired")
+        inference_digests = (
+            self.inference_code_manifest_sha256,
+            self.inference_attestation_identity_sha256,
+        )
+        if self.inference_backend_mode and not all(inference_digests):
+            raise ProtocolValidationError("an attested inference backend requires code and identity digests")
+        if not self.inference_backend_mode and any(inference_digests):
+            raise ProtocolValidationError("inference digests require an attested backend mode")
 
     def assert_compatible(self, embodiment: EmbodimentManifest) -> None:
         embodiment.validate()

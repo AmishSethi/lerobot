@@ -309,7 +309,7 @@ def test_lerobot_adapter_matches_physical_schema_and_lifecycle(tmp_path) -> None
 
 
 @pytest.mark.skipif(not mujoco_backend_available(), reason="MuJoCo and i2rt are optional")
-def test_mujoco_backend_uses_one_world_and_position_dynamics() -> None:
+def test_mujoco_backend_uses_one_world_and_tracks_position_targets() -> None:
     import mujoco
 
     config = BiYAMSimulatorConfig(
@@ -330,13 +330,32 @@ def test_mujoco_backend_uses_one_world_and_position_dynamics() -> None:
             assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, name) >= 0
         assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "workspace") >= 0
 
+        contact_body_pairs = {
+            frozenset((int(model.geom_bodyid[contact.geom1]), int(model.geom_bodyid[contact.geom2])))
+            for contact in simulator._backend._data.contact
+        }
+        for side in ("left", "right"):
+            base_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_base")
+            link1_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_link1")
+            assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_EXCLUDE, f"{side}_base_link1") >= 0
+            assert frozenset((base_id, link1_id)) not in contact_body_pairs
+
         initial = simulator.get_state()
         initial_frames = simulator.render_cameras()
-        target = _motion_target(initial)
+        target = initial.copy()
+        target[0] += 0.35
+        target[7] -= 0.30
         simulator.apply_action(target)
         first_step = simulator.get_state()
         assert not np.array_equal(first_step, initial)
         assert not np.allclose(first_step, target)
+
+        for _ in range(29):
+            simulator.apply_action(target)
+        final = simulator.get_state()
+        actual_motion = final[[0, 7]] - initial[[0, 7]]
+        assert actual_motion[0] > 0.20
+        assert actual_motion[1] < -0.20
 
         frames = simulator.render_cameras()
         assert tuple(frames) == CAMERA_NAMES
@@ -351,3 +370,33 @@ def test_mujoco_backend_uses_one_world_and_position_dynamics() -> None:
     finally:
         simulator.close()
     assert simulator._backend._model is None
+
+
+@pytest.mark.skipif(not mujoco_backend_available(), reason="MuJoCo and i2rt are optional")
+def test_mujoco_backend_maps_normalized_gripper_zero_closed_and_one_open() -> None:
+    import mujoco
+
+    simulator = BiYAMSimulator(
+        BiYAMSimulatorConfig(camera_height=8, camera_width=8),
+        backend="mujoco",
+    )
+    simulator.start()
+    try:
+        backend = simulator._backend
+
+        def projected_aperture_mm(gripper: float) -> float:
+            state = simulator.get_state()
+            state[[6, 13]] = gripper
+            backend._write_command_state(state)
+            mujoco.mj_forward(backend._model, backend._data)
+            np.testing.assert_allclose(backend._read_state()[[6, 13]], gripper, atol=1e-6)
+            left_tip = mujoco.mj_name2id(backend._model, mujoco.mjtObj.mjOBJ_BODY, "left_tip_left")
+            right_tip = mujoco.mj_name2id(backend._model, mujoco.mjtObj.mjOBJ_BODY, "left_tip_right")
+            jaw_joint = mujoco.mj_name2id(backend._model, mujoco.mjtObj.mjOBJ_JOINT, "left_joint7")
+            separation = backend._data.xpos[left_tip] - backend._data.xpos[right_tip]
+            return float(abs(np.dot(separation, backend._data.xaxis[jaw_joint])) * 1e3)
+
+        assert projected_aperture_mm(0.0) == pytest.approx(4.88, abs=0.05)
+        assert projected_aperture_mm(1.0) == pytest.approx(90.12, abs=0.2)
+    finally:
+        simulator.close()

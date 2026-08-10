@@ -1,0 +1,41 @@
+{
+  "schema_id": "umi-yam-pi05-onset-v3-checkpoint-gate-plan-v1",
+  "policy_type": "pi05",
+  "checkpoint_steps": [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000],
+  "holdout_episodes": [52, 53],
+  "fixed_seeds": [0, 1, 2, 3, 4],
+  "action_representation": "query-anchored-current-relative-SE3-R6D-plus-absolute-gripper",
+  "action_horizon_rows": 24,
+  "execution_horizon_rows": 15,
+  "num_flow_inference_steps": 10,
+  "policy_use_relative_actions": false,
+  "yam_start_driver_target": [0.0, 0.05, 0.05, 0.0, 0.0, 0.0, 1.0, 0.0, 0.05, 0.05, 0.0, 0.0, 0.0, 1.0],
+  "hardware_start_verified": false,
+  "stage1": {
+    "fresh_process_per_checkpoint_seed_episode": true,
+    "exact_effective_seed_attestation_required": true,
+    "all_first_15_rows_strict_ik_required": true,
+    "strict_position_tolerance_m": 0.002,
+    "strict_orientation_tolerance_deg": 1.0,
+    "operational_joint_limits_required": true,
+    "adapter_rate_limit_rad_per_dispatch": 0.02,
+    "driver_rate_limit_rad_per_dispatch": 0.1,
+    "maximum_ideal_feedback_dispatches_per_waypoint": 90,
+    "pooled_physical_se3_improvement_over_identity_required": 0.1,
+    "all_24_rows_are_diagnostic_only": true
+  },
+  "stage2": {
+    "required_for_every_stage1_eligible_checkpoint": true,
+    "teacher_forced_source_images_and_policy_state": true,
+    "predicted_yam_joints_carried_across_queries": true,
+    "query_stride_source_frames": 15,
+    "all_critical_first_15_rows_strict_ik_required": true,
+    "pooled_physical_se3_improvement_over_identity_required": 0.1,
+    "tail_and_gripper_metrics_are_diagnostic_only": true
+  },
+  "selection": {
+    "validation_loss_ranks_only_checkpoints_passing_both_stages": true,
+    "no_seed_or_episode_cherry_picking": true,
+    "hardware_deployment_ready": false
+  }
+}

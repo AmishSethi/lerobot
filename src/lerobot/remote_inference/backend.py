@@ -18,10 +18,14 @@ import abc
 import hashlib
 import json
 import logging
+import random
+import stat
 import threading
 import time
-from contextlib import nullcontext
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, replace
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -41,6 +45,178 @@ from .schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+MODEL_ARTIFACT_MANIFEST_SCHEMA_ID = "lerobot-model-artifact-tree-manifest-v1"
+CANONICAL_JSON_SPEC = "utf8-json-sorted-compact-ensure-ascii-false-reject-nonfinite-v1"
+_QUERY_ANCHOR_GRIPPER_REPRESENTATION = "query_anchor_delta_normalized_width"
+
+
+def _canonical_json_sha256(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_sha256(value: object, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _require_read_only_regular_file(path: Path, *, label: str) -> Path:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} must be a regular file, not a symlink: {path}")
+    if stat.S_IMODE(path.stat().st_mode) & 0o222:
+        raise ValueError(f"{label} must be read-only: {path}")
+    return path.resolve(strict=True)
+
+
+def _safe_artifact_relative_path(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty relative POSIX path")
+    relative = Path(value)
+    if value != relative.as_posix() or relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"{label} is not a safe relative POSIX path: {value!r}")
+    return value
+
+
+def verify_model_artifact_manifest(
+    *,
+    artifact_root: str | Path,
+    manifest_path: str | Path,
+    expected_manifest_sha256: str,
+) -> str:
+    """Verify an immutable, complete model/config/processor file tree.
+
+    The manifest is deliberately external to ``artifact_root`` so its own
+    checksum does not create a recursive inventory entry. The advertised tree
+    digest uses the onset-v4 training contract's frozen canonical JSON function
+    over the exact relative-path-to-SHA-256 map; byte sizes are independently
+    bound and checked for every file.
+    """
+
+    expected_manifest_sha256 = _require_sha256(
+        expected_manifest_sha256,
+        label="model artifact manifest expected SHA-256",
+    )
+    root_input = Path(artifact_root).expanduser()
+    if root_input.is_symlink() or not root_input.is_dir():
+        raise ValueError("model artifact root must be a real directory, not a symlink")
+    root = root_input.resolve(strict=True)
+    if stat.S_IMODE(root.stat().st_mode) & 0o222:
+        raise ValueError("model artifact root must be read-only")
+
+    manifest = _require_read_only_regular_file(
+        Path(manifest_path).expanduser(),
+        label="model artifact manifest",
+    )
+    if manifest.is_relative_to(root):
+        raise ValueError("model artifact manifest must be outside the inventoried artifact root")
+    actual_manifest_sha256 = _sha256_file(manifest)
+    if actual_manifest_sha256 != expected_manifest_sha256:
+        raise ValueError(
+            "model artifact manifest SHA-256 mismatch: "
+            f"expected {expected_manifest_sha256}, got {actual_manifest_sha256}"
+        )
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"model artifact manifest is not valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("model artifact manifest must contain a JSON object")
+    expected_keys = {
+        "schema_id",
+        "canonical_json_spec",
+        "file_count",
+        "files_sha256",
+        "files_size_bytes",
+        "tree_sha256",
+    }
+    if set(payload) != expected_keys:
+        raise ValueError(
+            f"model artifact manifest keys changed: expected {sorted(expected_keys)}, got {sorted(payload)}"
+        )
+    if payload["schema_id"] != MODEL_ARTIFACT_MANIFEST_SCHEMA_ID:
+        raise ValueError("unsupported model artifact manifest schema")
+    if payload["canonical_json_spec"] != CANONICAL_JSON_SPEC:
+        raise ValueError("model artifact manifest canonical JSON contract changed")
+    raw_sha256 = payload["files_sha256"]
+    raw_sizes = payload["files_size_bytes"]
+    if not isinstance(raw_sha256, Mapping) or not isinstance(raw_sizes, Mapping) or not raw_sha256:
+        raise ValueError("model artifact manifest file maps must be non-empty objects")
+
+    files_sha256: dict[str, str] = {}
+    files_size_bytes: dict[str, int] = {}
+    for raw_path, raw_digest in raw_sha256.items():
+        relative = _safe_artifact_relative_path(raw_path, label="model artifact file path")
+        files_sha256[relative] = _require_sha256(
+            raw_digest,
+            label=f"model artifact file SHA-256 for {relative}",
+        )
+    for raw_path, raw_size in raw_sizes.items():
+        relative = _safe_artifact_relative_path(raw_path, label="model artifact size path")
+        if isinstance(raw_size, bool) or not isinstance(raw_size, int) or raw_size < 0:
+            raise ValueError(f"model artifact byte size for {relative} must be a non-negative integer")
+        files_size_bytes[relative] = raw_size
+    if set(files_sha256) != set(files_size_bytes):
+        raise ValueError("model artifact SHA-256 and byte-size maps contain different paths")
+    file_count = payload["file_count"]
+    if isinstance(file_count, bool) or not isinstance(file_count, int) or file_count != len(files_sha256):
+        raise ValueError("model artifact manifest file_count does not match its file maps")
+    tree_sha256 = _require_sha256(payload["tree_sha256"], label="model artifact tree SHA-256")
+    if _canonical_json_sha256(files_sha256) != tree_sha256:
+        raise ValueError("model artifact tree SHA-256 does not match the canonical file map")
+
+    actual_files: set[str] = set()
+    for path in root.rglob("*"):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            raise ValueError(f"model artifact contains a symlink: {relative}")
+        if stat.S_IMODE(path.stat().st_mode) & 0o222:
+            raise ValueError(f"model artifact contains a writable path: {relative}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError(f"model artifact contains a non-regular entry: {relative}")
+        actual_files.add(relative)
+    if actual_files != set(files_sha256):
+        missing = sorted(set(files_sha256) - actual_files)
+        extra = sorted(actual_files - set(files_sha256))
+        raise ValueError(f"model artifact inventory mismatch: missing={missing}, extra={extra}")
+
+    for relative in sorted(files_sha256):
+        path = root / relative
+        actual_size = path.stat().st_size
+        if actual_size != files_size_bytes[relative]:
+            raise ValueError(
+                f"model artifact byte-size mismatch for {relative}: "
+                f"expected {files_size_bytes[relative]}, got {actual_size}"
+            )
+        actual_sha256 = _sha256_file(path)
+        if actual_sha256 != files_sha256[relative]:
+            raise ValueError(
+                f"model artifact SHA-256 mismatch for {relative}: "
+                f"expected {files_sha256[relative]}, got {actual_sha256}"
+            )
+    return tree_sha256
 
 
 class PolicyBackend(abc.ABC):
@@ -144,6 +320,19 @@ class LeRobotPolicyBackendConfig:
     model_dtype: str | None = None
     norm_tag: str | None = None
     inference_action_mode: str | None = None
+    gripper_action_representation: str | None = None
+    artifact_root: str | None = None
+    artifact_manifest_path: str | None = None
+    artifact_manifest_sha256: str | None = None
+    runtime_dependency_root: str | None = None
+    runtime_dependency_manifest_path: str | None = None
+    runtime_dependency_manifest_sha256: str | None = None
+    ik_release_report_path: str | None = None
+    ik_release_report_sha256: str | None = None
+    # Optional inference-only overrides.  ``None`` preserves the value saved in
+    # the checkpoint, so existing policy-server invocations are unchanged.
+    per_episode_seed: bool | None = None
+    eval_seed: int | None = None
 
 
 class LeRobotPolicyBackend(PolicyBackend):
@@ -152,9 +341,25 @@ class LeRobotPolicyBackend(PolicyBackend):
     def __init__(self, config: LeRobotPolicyBackendConfig):
         self._config = config
         self._device = torch.device(config.device)
-        self._lock = threading.Lock()
+        # Warmup snapshots and restores inference RNG state while calling the
+        # regular reset/infer paths.  An RLock keeps that transaction atomic
+        # without duplicating the locked inference implementation.
+        self._lock = threading.RLock()
         self._prepared_input: tuple[tuple[tuple[str, int, int], ...], str] | None = None
-        self._policy_config = self._load_policy_config(config)
+        (
+            load_config,
+            self._artifact_tree_sha256,
+            self._artifact_manifest_sha256,
+            self._runtime_dependency_root,
+            self._runtime_dependency_tree_sha256,
+            self._runtime_dependency_manifest_sha256,
+            self._ik_release_report_sha256,
+        ) = self._verified_load_config(config)
+        self._policy_config = self._load_policy_config(load_config)
+        self._runtime_dependency_source = self._rebind_runtime_dependency(
+            self._policy_config,
+            self._runtime_dependency_root,
+        )
         self._dataset_stats = None
         if config.policy_type == "molmoact2":
             self._dataset_stats = self._configure_original_molmoact2(self._policy_config)
@@ -165,7 +370,7 @@ class LeRobotPolicyBackend(PolicyBackend):
             self._policy = policy_class(self._policy_config)
         else:
             self._policy = policy_class.from_pretrained(
-                config.pretrained_name_or_path,
+                load_config.pretrained_name_or_path,
                 config=self._policy_config,
                 revision=self._policy_config.pretrained_revision,
             )
@@ -175,16 +380,208 @@ class LeRobotPolicyBackend(PolicyBackend):
         # host raises "Requested device 'cuda' but CUDA is not available" while the policy
         # config itself downgrades to CPU gracefully. Actions are moved to CPU in infer(),
         # so pinning both pipelines to the serving device is safe.
-        device_override = {"device_processor": {"device": config.device}}
+        preprocessor_override = {"device_processor": {"device": config.device}}
+        postprocessor_override = {"device_processor": {"device": config.device}}
+        if self._runtime_dependency_root and self._policy_config.type == "molmoact2":
+            # The saved pipeline contains the training host's absolute base-model
+            # path.  Rebind only this dependency-bearing step to the already
+            # verified local snapshot; every normalization state remains loaded
+            # byte-for-byte from the manifested fine-tuned artifact.
+            preprocessor_override["molmoact2_pack_inputs"] = {
+                "checkpoint_path": self._runtime_dependency_root
+            }
         self._preprocessor, self._postprocessor = make_pre_post_processors(
             self._policy_config,
-            pretrained_path=None if config.policy_type == "molmoact2" else config.pretrained_name_or_path,
+            pretrained_path=(
+                None if config.policy_type == "molmoact2" else load_config.pretrained_name_or_path
+            ),
             pretrained_revision=self._policy_config.pretrained_revision,
             dataset_stats=self._dataset_stats,
-            preprocessor_overrides=device_override,
-            postprocessor_overrides=device_override,
+            preprocessor_overrides=preprocessor_override,
+            postprocessor_overrides=postprocessor_override,
         )
+        if self._runtime_dependency_root and self._policy_config.type == "molmoact2":
+            dependency_root = Path(self._runtime_dependency_root)
+            processor_paths = [
+                Path(str(step.checkpoint_path)).expanduser().resolve(strict=True)
+                for step in self._preprocessor.steps
+                if hasattr(step, "checkpoint_path")
+            ]
+            if not processor_paths or any(path != dependency_root for path in processor_paths):
+                raise ValueError(
+                    "MolmoAct2 saved processor dependency does not equal the verified runtime dependency root"
+                )
         self._manifest = self._build_manifest()
+
+    @staticmethod
+    def _rebind_runtime_dependency(
+        policy_config: PreTrainedConfig,
+        runtime_dependency_root: str,
+    ) -> dict[str, str] | None:
+        """Portably rebind one manifested external base without changing its revision.
+
+        Fine-tuned MolmoAct2 and Pi0.5 configs record absolute paths from the
+        training cluster.  Requiring the same mount path on a hardware host is
+        neither portable nor an identity check.  Identity is supplied by the
+        complete read-only dependency manifest, while the saved config (itself
+        inside the manifested model artifact) supplies the immutable source
+        revision.  This method records that source and changes only the local
+        path used to construct the policy.
+        """
+
+        if not runtime_dependency_root:
+            return None
+        fields = {
+            "molmoact2": ("checkpoint_path", "checkpoint_revision"),
+            "pi05": ("pretrained_path", "pretrained_revision"),
+        }.get(policy_config.type)
+        if fields is None:
+            raise ValueError("runtime dependency attestation is supported only for MolmoAct2 and Pi0.5")
+        path_attribute, revision_attribute = fields
+        saved_path = str(getattr(policy_config, path_attribute, "") or "").strip()
+        if not saved_path:
+            raise ValueError(f"{policy_config.type} config.{path_attribute} is missing")
+        saved_revision = str(getattr(policy_config, revision_attribute, "") or "").strip()
+        if (
+            len(saved_revision) != 40
+            or saved_revision != saved_revision.lower()
+            or any(character not in "0123456789abcdef" for character in saved_revision)
+        ):
+            raise ValueError(
+                f"{policy_config.type} config.{revision_attribute} must be an immutable 40-hex revision"
+            )
+        verified_root = Path(runtime_dependency_root).resolve(strict=True)
+        setattr(policy_config, path_attribute, str(verified_root))
+        return {
+            "saved_path": saved_path,
+            "saved_revision": saved_revision,
+            "verified_local_root": str(verified_root),
+        }
+
+    @staticmethod
+    def _verified_load_config(
+        config: LeRobotPolicyBackendConfig,
+    ) -> tuple[LeRobotPolicyBackendConfig, str, str, str, str, str, str]:
+        artifact_values = (
+            config.artifact_root,
+            config.artifact_manifest_path,
+            config.artifact_manifest_sha256,
+        )
+        any_artifact_value = any(value is not None and str(value).strip() for value in artifact_values)
+        all_manifest_values = all(
+            value is not None and str(value).strip()
+            for value in (config.artifact_manifest_path, config.artifact_manifest_sha256)
+        )
+        if any_artifact_value and not all_manifest_values:
+            raise ValueError(
+                "model artifact attestation requires artifact_manifest_path and artifact_manifest_sha256"
+            )
+        dependency_values = (
+            config.runtime_dependency_root,
+            config.runtime_dependency_manifest_path,
+            config.runtime_dependency_manifest_sha256,
+        )
+        any_dependency_value = any(value is not None and str(value).strip() for value in dependency_values)
+        all_dependency_values = all(value is not None and str(value).strip() for value in dependency_values)
+        if any_dependency_value and not all_dependency_values:
+            raise ValueError(
+                "runtime dependency attestation requires root, manifest path, and manifest SHA-256"
+            )
+        report_values = (config.ik_release_report_path, config.ik_release_report_sha256)
+        if any(value is not None and str(value).strip() for value in report_values) and not all(
+            value is not None and str(value).strip() for value in report_values
+        ):
+            raise ValueError(
+                "IK release attestation requires ik_release_report_path and ik_release_report_sha256"
+            )
+        gripper_representation = str(config.gripper_action_representation or "").strip()
+        if gripper_representation == _QUERY_ANCHOR_GRIPPER_REPRESENTATION and (
+            not all_manifest_values
+            or not all(value is not None and str(value).strip() for value in report_values)
+        ):
+            raise ValueError(
+                "query-anchor jaw-delta serving requires complete model artifact and IK release attestations"
+            )
+
+        artifact_tree_sha256 = ""
+        artifact_manifest_sha256 = ""
+        load_path = config.pretrained_name_or_path
+        if all_manifest_values:
+            configured_model_path = Path(config.pretrained_name_or_path).expanduser()
+            root = Path(config.artifact_root or config.pretrained_name_or_path).expanduser()
+            if configured_model_path.is_dir():
+                if root.resolve(strict=True) != configured_model_path.resolve(strict=True):
+                    raise ValueError("a local pretrained_name_or_path must equal the verified artifact_root")
+            else:
+                revision = str(config.revision or "")
+                if (
+                    len(revision) != 40
+                    or revision != revision.lower()
+                    or any(character not in "0123456789abcdef" for character in revision)
+                ):
+                    raise ValueError(
+                        "a Hub model artifact requires an explicit immutable 40-hex commit revision"
+                    )
+                if config.artifact_root is None:
+                    raise ValueError(
+                        "a Hub model artifact must be materialized as a verified local artifact_root"
+                    )
+            artifact_tree_sha256 = verify_model_artifact_manifest(
+                artifact_root=root,
+                manifest_path=str(config.artifact_manifest_path),
+                expected_manifest_sha256=str(config.artifact_manifest_sha256),
+            )
+            artifact_manifest_sha256 = _require_sha256(
+                str(config.artifact_manifest_sha256),
+                label="model artifact manifest expected SHA-256",
+            )
+            load_path = str(root.resolve(strict=True))
+
+        runtime_dependency_root = ""
+        runtime_dependency_tree_sha256 = ""
+        runtime_dependency_manifest_sha256 = ""
+        if all_dependency_values:
+            dependency_root = Path(str(config.runtime_dependency_root)).expanduser().resolve(strict=True)
+            if all_manifest_values and dependency_root == Path(load_path).resolve(strict=True):
+                raise ValueError(
+                    "runtime dependency root must be distinct from the selected model artifact root"
+                )
+            runtime_dependency_tree_sha256 = verify_model_artifact_manifest(
+                artifact_root=dependency_root,
+                manifest_path=str(config.runtime_dependency_manifest_path),
+                expected_manifest_sha256=str(config.runtime_dependency_manifest_sha256),
+            )
+            runtime_dependency_root = str(dependency_root)
+            runtime_dependency_manifest_sha256 = _require_sha256(
+                str(config.runtime_dependency_manifest_sha256),
+                label="runtime dependency manifest expected SHA-256",
+            )
+
+        ik_release_report_sha256 = ""
+        if all(value is not None and str(value).strip() for value in report_values):
+            ik_release_report_sha256 = _require_sha256(
+                str(config.ik_release_report_sha256),
+                label="IK release report expected SHA-256",
+            )
+            report = _require_read_only_regular_file(
+                Path(str(config.ik_release_report_path)).expanduser(),
+                label="IK release report",
+            )
+            actual_report_sha256 = _sha256_file(report)
+            if actual_report_sha256 != ik_release_report_sha256:
+                raise ValueError(
+                    "IK release report SHA-256 mismatch: "
+                    f"expected {ik_release_report_sha256}, got {actual_report_sha256}"
+                )
+        return (
+            replace(config, pretrained_name_or_path=load_path),
+            artifact_tree_sha256,
+            artifact_manifest_sha256,
+            runtime_dependency_root,
+            runtime_dependency_tree_sha256,
+            runtime_dependency_manifest_sha256,
+            (ik_release_report_sha256),
+        )
 
     @staticmethod
     def _load_policy_config(config: LeRobotPolicyBackendConfig) -> PreTrainedConfig:
@@ -217,6 +614,17 @@ class LeRobotPolicyBackend(PolicyBackend):
             policy_config.norm_tag = config.norm_tag
         if config.inference_action_mode is not None and hasattr(policy_config, "inference_action_mode"):
             policy_config.inference_action_mode = config.inference_action_mode
+        if config.per_episode_seed is not None:
+            if not hasattr(policy_config, "per_episode_seed"):
+                raise ValueError(
+                    "policy.per_episode_seed was provided, but this policy does not support "
+                    "rollout-local inference generators"
+                )
+            policy_config.per_episode_seed = config.per_episode_seed
+        if config.eval_seed is not None:
+            if not hasattr(policy_config, "eval_seed"):
+                raise ValueError("policy.eval_seed was provided, but this policy does not support eval seeds")
+            policy_config.eval_seed = config.eval_seed
         policy_config.device = config.device
         return policy_config
 
@@ -277,40 +685,77 @@ class LeRobotPolicyBackend(PolicyBackend):
         camera_shapes = tuple((camera.key, camera.height, camera.width) for camera in embodiment.cameras)
         self._run_warmup(camera_shapes, task=task)
 
-    def _run_warmup(self, camera_shapes: tuple[tuple[str, int, int], ...], *, task: str) -> None:
-        prepared_input = (camera_shapes, task)
-        if prepared_input == self._prepared_input:
-            return
-        state = np.zeros(len(self._manifest.state_features), dtype=np.float32)
-        if self._dataset_stats is not None:
-            state_stats = self._dataset_stats.get(OBS_STATE, {})
-            center = state_stats.get("q50", state_stats.get("mean"))
-            if center is not None and np.asarray(center).shape == state.shape:
-                state = np.asarray(center, dtype=np.float32)
-        images = tuple(
-            ImageFrame(
-                key=camera_key,
-                array=np.zeros((height, width, 3), dtype=np.uint8),
-                capture_monotonic_ns=0,
+    @contextmanager
+    def _preserve_inference_rng_state(self) -> Iterator[None]:
+        """Make synthetic warmup RNG-neutral for global and policy-local generators."""
+
+        python_rng_state = random.getstate()
+        numpy_rng_state = np.random.get_state()
+        torch_cpu_rng_state = torch.random.get_rng_state()
+        torch_cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+        snapshot_policy_rng = getattr(self._policy, "snapshot_inference_rng_state", None)
+        restore_policy_rng = getattr(self._policy, "restore_inference_rng_state", None)
+        if callable(snapshot_policy_rng) != callable(restore_policy_rng):
+            raise RuntimeError(
+                "policies must implement both snapshot_inference_rng_state() and "
+                "restore_inference_rng_state(), or neither"
             )
-            for camera_key, height, width in camera_shapes
-        )
-        observation = PolicyObservation(
-            episode_id="server-warmup",
-            sequence=0,
-            capture_tick=0,
-            capture_monotonic_ns=0,
-            state=state,
-            images=images,
-            task=task,
-            last_executed_tick=0,
-            action_queue_depth=0,
-        )
-        started = time.perf_counter()
-        self.reset()
-        self.infer(observation)
-        self.reset()
-        self._prepared_input = prepared_input
+        policy_rng_state = snapshot_policy_rng() if callable(snapshot_policy_rng) else None
+        try:
+            yield
+        finally:
+            try:
+                if callable(restore_policy_rng):
+                    restore_policy_rng(policy_rng_state)
+            finally:
+                random.setstate(python_rng_state)
+                np.random.set_state(numpy_rng_state)
+                torch.random.set_rng_state(torch_cpu_rng_state)
+                if torch_cuda_rng_states is not None:
+                    torch.cuda.set_rng_state_all(torch_cuda_rng_states)
+
+    def _run_warmup(self, camera_shapes: tuple[tuple[str, int, int], ...], *, task: str) -> None:
+        # Preparation can be called with the real task text.  Keep the entire
+        # check/warmup/update transaction under the inference lock so the
+        # synthetic request cannot consume an episode seed or race a request.
+        with self._lock:
+            prepared_input = (camera_shapes, task)
+            if prepared_input == self._prepared_input:
+                return
+            state = np.zeros(len(self._manifest.state_features), dtype=np.float32)
+            if self._dataset_stats is not None:
+                state_stats = self._dataset_stats.get(OBS_STATE, {})
+                center = state_stats.get("q50", state_stats.get("mean"))
+                if center is not None and np.asarray(center).shape == state.shape:
+                    state = np.asarray(center, dtype=np.float32)
+            images = tuple(
+                ImageFrame(
+                    key=camera_key,
+                    array=np.zeros((height, width, 3), dtype=np.uint8),
+                    capture_monotonic_ns=0,
+                )
+                for camera_key, height, width in camera_shapes
+            )
+            observation = PolicyObservation(
+                episode_id="server-warmup",
+                sequence=0,
+                capture_tick=0,
+                capture_monotonic_ns=0,
+                state=state,
+                images=images,
+                task=task,
+                last_executed_tick=0,
+                action_queue_depth=0,
+            )
+            started = time.perf_counter()
+            with self._preserve_inference_rng_state():
+                self.reset()
+                try:
+                    self.infer(observation)
+                finally:
+                    self.reset()
+            self._prepared_input = prepared_input
         logger.info("Policy warmup completed in %.2fs", time.perf_counter() - started)
 
     def _configured_image_size(self, camera_key: str) -> tuple[int, int]:
@@ -391,6 +836,14 @@ class LeRobotPolicyBackend(PolicyBackend):
         )
         revision = self._config.revision or "main"
         norm_tag = str(getattr(self._policy_config, "norm_tag", "") or "")
+        gripper_action_representation = str(self._config.gripper_action_representation or "").strip()
+        artifact_tree_sha256 = str(getattr(self, "_artifact_tree_sha256", "") or "")
+        artifact_manifest_sha256 = str(getattr(self, "_artifact_manifest_sha256", "") or "")
+        runtime_dependency_tree_sha256 = str(getattr(self, "_runtime_dependency_tree_sha256", "") or "")
+        runtime_dependency_manifest_sha256 = str(
+            getattr(self, "_runtime_dependency_manifest_sha256", "") or ""
+        )
+        ik_release_report_sha256 = str(getattr(self, "_ik_release_report_sha256", "") or "")
         fingerprint = _model_fingerprint(
             model_id=self._config.pretrained_name_or_path,
             revision=revision,
@@ -400,6 +853,12 @@ class LeRobotPolicyBackend(PolicyBackend):
             state_features=state_features,
             action_features=action_features,
             camera_keys=camera_keys,
+            gripper_action_representation=gripper_action_representation,
+            artifact_tree_sha256=artifact_tree_sha256,
+            artifact_manifest_sha256=artifact_manifest_sha256,
+            runtime_dependency_tree_sha256=runtime_dependency_tree_sha256,
+            runtime_dependency_manifest_sha256=runtime_dependency_manifest_sha256,
+            ik_release_report_sha256=ik_release_report_sha256,
         )
         manifest = ModelManifest(
             model_id=self._config.pretrained_name_or_path,
@@ -412,6 +871,12 @@ class LeRobotPolicyBackend(PolicyBackend):
             action_features=action_features,
             camera_keys=camera_keys,
             fingerprint=fingerprint,
+            gripper_action_representation=gripper_action_representation,
+            artifact_tree_sha256=artifact_tree_sha256,
+            artifact_manifest_sha256=artifact_manifest_sha256,
+            runtime_dependency_tree_sha256=runtime_dependency_tree_sha256,
+            runtime_dependency_manifest_sha256=runtime_dependency_manifest_sha256,
+            ik_release_report_sha256=ik_release_report_sha256,
         )
         manifest.validate()
         return manifest
@@ -465,18 +930,50 @@ def _model_fingerprint(
     state_features: tuple[str, ...],
     action_features: tuple[str, ...],
     camera_keys: tuple[str, ...],
+    gripper_action_representation: str = "",
+    artifact_tree_sha256: str = "",
+    artifact_manifest_sha256: str = "",
+    runtime_dependency_tree_sha256: str = "",
+    runtime_dependency_manifest_sha256: str = "",
+    inference_backend_mode: str = "",
+    inference_seed: int = 0,
+    inference_code_manifest_sha256: str = "",
+    inference_attestation_identity_sha256: str = "",
+    ik_release_report_sha256: str = "",
 ) -> str:
+    fingerprint_fields = {
+        "model_id": model_id,
+        "revision": revision,
+        "policy_type": policy_type,
+        "norm_tag": norm_tag,
+        "horizon": horizon,
+        "state_features": state_features,
+        "action_features": action_features,
+        "camera_keys": camera_keys,
+    }
+    if gripper_action_representation:
+        fingerprint_fields["gripper_action_representation"] = gripper_action_representation
+    if artifact_tree_sha256:
+        fingerprint_fields["artifact_tree_sha256"] = artifact_tree_sha256
+    if artifact_manifest_sha256:
+        fingerprint_fields["artifact_manifest_sha256"] = artifact_manifest_sha256
+    if runtime_dependency_tree_sha256:
+        fingerprint_fields["runtime_dependency_tree_sha256"] = runtime_dependency_tree_sha256
+    if runtime_dependency_manifest_sha256:
+        fingerprint_fields["runtime_dependency_manifest_sha256"] = runtime_dependency_manifest_sha256
+    if inference_backend_mode:
+        fingerprint_fields.update(
+            {
+                "inference_backend_mode": inference_backend_mode,
+                "inference_seed": inference_seed,
+                "inference_code_manifest_sha256": inference_code_manifest_sha256,
+                "inference_attestation_identity_sha256": inference_attestation_identity_sha256,
+            }
+        )
+    if ik_release_report_sha256:
+        fingerprint_fields["ik_release_report_sha256"] = ik_release_report_sha256
     payload = json.dumps(
-        {
-            "model_id": model_id,
-            "revision": revision,
-            "policy_type": policy_type,
-            "norm_tag": norm_tag,
-            "horizon": horizon,
-            "state_features": state_features,
-            "action_features": action_features,
-            "camera_keys": camera_keys,
-        },
+        fingerprint_fields,
         sort_keys=True,
         separators=(",", ":"),
     ).encode()

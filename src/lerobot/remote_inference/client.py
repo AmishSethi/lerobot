@@ -71,6 +71,9 @@ class RemotePolicySession:
     session_id: str
     model: ModelManifest
     command_ttl_ms: int
+    server_revision: str
+    server_config_sha256: str
+    service_name: str = ""
 
 
 class RemotePolicyClient:
@@ -135,6 +138,8 @@ class RemotePolicyClient:
             )
             if info.protocol_version != PROTOCOL_VERSION or not info.ready:
                 raise RemotePolicyError("remote policy server is not compatible or ready")
+            if not info.service_name or info.service_name != info.service_name.strip():
+                raise RemotePolicyError("remote policy server service_name is missing or malformed")
             advertised_model = model_from_proto(info.model)
             advertised_model.assert_compatible(embodiment)
             response = self._stub.OpenSession(
@@ -161,6 +166,9 @@ class RemotePolicyClient:
             session_id=response.session_id,
             model=model,
             command_ttl_ms=response.command_ttl_ms,
+            server_revision=response.server_revision,
+            server_config_sha256=response.server_config_sha256,
+            service_name=info.service_name,
         )
         self._last_sequence = -1
         return self._session

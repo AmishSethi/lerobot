@@ -35,8 +35,10 @@ from lerobot.robots.bi_yam import (
     BiYAMFollowerConfig,
     YAMArmConfig,
 )
+from lerobot.robots.bi_yam.config_bi_yam import YAM_JOINT_LIMITS
 from lerobot.robots.bi_yam.worker import (
     ArmCommand,
+    ArmCommandError,
     ArmControl,
     ArmState,
     ArmWorkerRuntime,
@@ -137,6 +139,9 @@ class FakeWorker:
         self.control_sequence = 0
         self.last_applied_sequence = -1
         self.last_applied_positions: tuple[float, ...] | None = None
+        self.last_applied_monotonic_ns: int | None = None
+        self.last_dispatch_started_monotonic_ns: int | None = None
+        self.last_driver_acknowledged_monotonic_ns: int | None = None
         self.commands: list[ArmCommand] = []
         self.disarm_calls = 0
         self.close_calls = 0
@@ -155,6 +160,9 @@ class FakeWorker:
             last_applied_positions=self.last_applied_positions,
             gripper_limits=self.gripper_limits,
             fault=self.fault,
+            last_applied_monotonic_ns=self.last_applied_monotonic_ns,
+            last_dispatch_started_monotonic_ns=self.last_dispatch_started_monotonic_ns,
+            last_driver_acknowledged_monotonic_ns=self.last_driver_acknowledged_monotonic_ns,
         )
 
     def start(self, timeout_s: float) -> ArmState:
@@ -194,6 +202,9 @@ class FakeWorker:
             self.positions = np.asarray(command.positions, dtype=np.float64)
         self.last_applied_sequence = command.sequence
         self.last_applied_positions = command.positions
+        self.last_applied_monotonic_ns = time.monotonic_ns()
+        self.last_dispatch_started_monotonic_ns = self.last_applied_monotonic_ns
+        self.last_driver_acknowledged_monotonic_ns = self.last_applied_monotonic_ns
         self.idle = False
 
     def wait_applied(self, sequence: int, timeout_s: float) -> ArmState:
@@ -240,8 +251,8 @@ def make_config(tmp_path, **overrides) -> BiYAMFollowerConfig:
         "left_arm_config": YAMArmConfig(channel="can0", sim=True),
         "right_arm_config": YAMArmConfig(channel="can1", sim=True),
         "command_lead_time_s": 0.0,
-        "left_joint_limits": [(-1.0, 1.0)] * 6,
-        "right_joint_limits": [(-1.0, 1.0)] * 6,
+        "left_joint_limits": [(-1.0, 1.0), (0.0, 1.0), (0.0, 1.0), *([(-1.0, 1.0)] * 3)],
+        "right_joint_limits": [(-1.0, 1.0), (0.0, 1.0), (0.0, 1.0), *([(-1.0, 1.0)] * 3)],
         "max_joint_delta": 0.2,
         "max_gripper_delta": 0.1,
     }
@@ -316,7 +327,7 @@ def test_generic_config_has_portable_tested_defaults_and_factory_support(tmp_pat
     assert (*([0.0] * 6), 1.0, *([0.0] * 6), 1.0) == BI_YAM_POLICY_START_POSITION
     assert config.policy_start_position == BI_YAM_POLICY_START_POSITION
     assert config.policy_reset_step_size == 0.01
-    assert config.policy_reset_max_steps == 100
+    assert config.policy_reset_max_steps == 900
     assert config.policy_reset_fps == 30
     assert config.policy_reset_tolerance == 0.035
     assert config.policy_reset_timeout_s == 30
@@ -329,6 +340,50 @@ def test_generic_config_has_portable_tested_defaults_and_factory_support(tmp_pat
     assert isinstance(robot, BiYAMFollower)
     assert robot.calibration_fpath == tmp_path / "lab_yam.json"
     assert not robot.is_calibrated
+
+
+@pytest.mark.parametrize(
+    ("side", "joint_index", "widen_lower"),
+    (("left", 0, True), ("right", 5, False)),
+)
+def test_config_rejects_per_arm_limits_wider_than_authoritative_yam(
+    tmp_path,
+    side,
+    joint_index,
+    widen_lower,
+):
+    limits = list(YAM_JOINT_LIMITS)
+    lower, upper = limits[joint_index]
+    limits[joint_index] = (
+        lower - 0.001 if widen_lower else lower,
+        upper if widen_lower else upper + 0.001,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{side}_joint_limits\[{joint_index}\] must stay within authoritative YAM limits",
+    ):
+        make_config(tmp_path, **{f"{side}_joint_limits": limits})
+
+
+@pytest.mark.parametrize("side", ("left", "right"))
+def test_config_accepts_tightened_per_arm_yam_limits(tmp_path, side):
+    tightened = [(max(lower, -0.5), min(upper, 0.5)) for lower, upper in YAM_JOINT_LIMITS]
+
+    config = make_config(tmp_path, **{f"{side}_joint_limits": tightened})
+
+    assert getattr(config, f"{side}_joint_limits") == tightened
+
+
+def test_policy_reset_reachability_uses_effective_driver_clipped_step(tmp_path) -> None:
+    with pytest.raises(ValueError, match="effective driver-clipped reset step"):
+        make_config(
+            tmp_path,
+            policy_reset_step_size=1.0,
+            max_joint_delta=0.01,
+            max_gripper_delta=0.01,
+            policy_reset_max_steps=10,
+        )
 
 
 def test_generic_rollout_requires_id_scoped_calibration_before_worker_creation(tmp_path):
@@ -718,11 +773,102 @@ def test_send_action_clips_limits_and_delta_and_synchronizes_workers(tmp_path):
     assert record["names"] == list(YAM_SCALAR_KEYS)
     assert record["requested"] == pytest.approx([10.0] * 14)
     assert record["applied"] == pytest.approx(expected)
-    assert record["measured_before"] == pytest.approx([0.0] * 14)
-    assert record["measured_after"] == pytest.approx(expected)
-    assert record["applied_tracking_error"] == pytest.approx([0.0] * 14)
+    assert record["state_before_dispatch"] == pytest.approx([0.0] * 14)
+    assert record["state_at_acknowledgement"] == pytest.approx(expected)
+    assert record["applied_vs_ack_state_error"] == pytest.approx([0.0] * 14)
+    assert record["acknowledgement_confirms_achievement"] is False
     assert record["bound_clipped"] == list(YAM_SCALAR_KEYS)
     assert record["delta_clipped"] == list(YAM_SCALAR_KEYS)
+
+
+def test_pre_dispatch_validator_receives_normal_send_target(tmp_path):
+    validated = []
+    config = make_config(tmp_path, max_joint_delta=1.0, max_gripper_delta=1.0)
+    robot, workers = make_robot(tmp_path, config=config)
+    robot.set_pre_dispatch_validator(lambda command: validated.append(dict(command)))
+    robot.connect()
+    robot.arm()
+    requested = dict.fromkeys(YAM_SCALAR_KEYS, 0.05)
+
+    applied = robot.send_action(requested)
+
+    assert validated == [applied]
+    dispatched = (*workers["left"].commands[-1].positions, *workers["right"].commands[-1].positions)
+    assert tuple(validated[0].values()) == pytest.approx(dispatched)
+    robot.disconnect()
+
+
+def test_dispatch_timestamp_is_allocated_after_endpoint_validation(tmp_path):
+    events = []
+    config = make_config(tmp_path, command_lead_time_s=0.01)
+    robot, workers = make_robot(tmp_path, config=config)
+
+    def validate(_command):
+        # Discard state-refresh clock reads; only ordering at the dispatch
+        # boundary matters here.
+        events.clear()
+        events.append("validate")
+
+    def monotonic_ns():
+        # ``send_action`` also reads this clock while checking fresh measured
+        # state. Keep those reads realistic, then expose the sentinel only
+        # after the validator marks the dispatch boundary.
+        if events == ["validate"]:
+            events.append("clock")
+            return 1_000
+        return time.monotonic_ns()
+
+    robot.set_pre_dispatch_validator(validate)
+    robot.connect()
+    robot.arm()
+    # Install the fake dispatch clock only after startup freshness checks, which
+    # must compare worker timestamps against the real monotonic clock.
+    robot._monotonic_ns = monotonic_ns
+
+    robot.send_action(zero_action())
+
+    assert events[:2] == ["validate", "clock"]
+    expected_execute_at_ns = 1_000 + 10_000_000
+    assert workers["left"].commands[-1].execute_at_ns == expected_execute_at_ns
+    assert workers["right"].commands[-1].execute_at_ns == expected_execute_at_ns
+    robot.disconnect()
+
+
+def test_pre_dispatch_validator_receives_driver_clipped_target(tmp_path):
+    validated = []
+    config = make_config(tmp_path, max_joint_delta=0.2, max_gripper_delta=0.1)
+    robot, workers = make_robot(tmp_path, config=config)
+    robot.set_pre_dispatch_validator(lambda command: validated.append(dict(command)))
+    robot.connect()
+    robot.arm()
+
+    applied = robot.send_action(dict.fromkeys(YAM_SCALAR_KEYS, 20.0))
+
+    expected = [0.2] * 6 + [0.1] + [0.2] * 6 + [0.1]
+    assert tuple(applied.values()) == pytest.approx(expected)
+    assert tuple(validated[0].values()) == pytest.approx(expected)
+    dispatched = (*workers["left"].commands[-1].positions, *workers["right"].commands[-1].positions)
+    assert dispatched == pytest.approx(expected)
+    robot.disconnect()
+
+
+def test_pre_dispatch_validator_failure_prevents_send_and_disarms(tmp_path):
+    robot, workers = make_robot(tmp_path)
+
+    def reject(_command):
+        raise RuntimeError("unsafe endpoint")
+
+    robot.set_pre_dispatch_validator(reject)
+    robot.connect()
+    robot.arm()
+
+    with pytest.raises(RuntimeError, match="unsafe endpoint"):
+        robot.send_action(zero_action())
+
+    assert workers["left"].commands == []
+    assert workers["right"].commands == []
+    assert not robot.is_armed
+    robot.disconnect()
 
 
 def test_operational_limit_clipping_is_reflected_in_returned_action(tmp_path):
@@ -778,6 +924,75 @@ def test_policy_reset_reaches_configured_pose_with_molmoact2_sized_steps(tmp_pat
     assert len(records) == len(commands)
     assert {record["phase"] for record in records} <= {"reset", "reset_hold"}
     assert records[-1]["applied"] == pytest.approx(target)
+
+
+def test_policy_reset_validates_every_final_endpoint_before_dispatch(tmp_path):
+    validated = []
+    target = BI_YAM_POLICY_START_POSITION
+    config = make_config(
+        tmp_path,
+        policy_start_position=target,
+        policy_reset_step_size=0.5,
+        policy_reset_fps=10_000,
+        policy_reset_tolerance=0.001,
+        policy_reset_timeout_s=0.5,
+    )
+    robot, workers = make_robot(tmp_path, config=config)
+    initial = np.asarray([*([0.5] * 6), 0.0, *([0.5] * 6), 0.0], dtype=np.float64)
+    robot.set_pre_dispatch_validator(lambda command: validated.append(dict(command)))
+    robot.connect()
+    workers["left"].positions = initial[:7].copy()
+    workers["right"].positions = initial[7:].copy()
+    robot.arm()
+
+    robot.reset_for_policy()
+
+    dispatched = [
+        (*left.positions, *right.positions)
+        for left, right in zip(
+            workers["left"].commands,
+            workers["right"].commands,
+            strict=True,
+        )
+    ]
+    # Every dispatched endpoint is checked, followed by one check of the fresh
+    # measured endpoint that proves reset completion without another command.
+    assert len(validated) == len(dispatched) + 1
+    assert dispatched
+    for checked, command in zip(validated[:-1], dispatched, strict=True):
+        assert tuple(checked.values()) == pytest.approx(command)
+    # Reset requested a 0.5 step, but the exact validated/dispatched endpoint
+    # reflects the driver's tighter per-call joint/gripper caps.
+    assert validated[0]["left_joint_0.pos"] == pytest.approx(0.3)
+    assert validated[0]["left_gripper.pos"] == pytest.approx(0.1)
+    assert tuple(validated[-1].values()) == pytest.approx(target)
+    robot.disconnect()
+
+
+def test_policy_reset_validates_measured_endpoint_when_already_at_target(tmp_path):
+    checked = []
+    robot, workers = make_robot(tmp_path)
+
+    def reject(command):
+        checked.append(dict(command))
+        raise RuntimeError("unsafe reset endpoint")
+
+    robot.set_pre_dispatch_validator(reject)
+    robot.connect()
+    target = np.asarray(BI_YAM_POLICY_START_POSITION, dtype=np.float64)
+    workers["left"].positions = target[:7].copy()
+    workers["right"].positions = target[7:].copy()
+    robot.arm()
+
+    with pytest.raises(RuntimeError, match="unsafe reset endpoint"):
+        robot.reset_for_policy()
+
+    assert len(checked) == 1
+    assert tuple(checked[0].values()) == pytest.approx(target)
+    assert workers["left"].commands == []
+    assert workers["right"].commands == []
+    assert not robot.is_armed
+    robot.disconnect()
 
 
 def test_policy_end_reset_uses_fixed_home_pose_instead_of_configured_start(tmp_path):
@@ -842,6 +1057,21 @@ def test_policy_reset_timeout_disarms_both_workers(tmp_path):
     with pytest.raises(TimeoutError, match="did not reach its policy start position"):
         robot.reset_for_policy()
 
+    commands = np.asarray(
+        [
+            (*left.positions, *right.positions)
+            for left, right in zip(
+                workers["left"].commands,
+                workers["right"].commands,
+                strict=True,
+            )
+        ]
+    )
+    assert len(commands) > 1
+    # The fake plant never moves. Every retry must therefore remain one reset
+    # step from the same fresh measured state rather than following an open-loop
+    # trajectory farther away.
+    assert np.max(np.abs(commands)) <= config.policy_reset_step_size + 1e-9
     assert not robot.is_armed
     assert all(worker.disarm_calls >= 1 for worker in workers.values())
     robot.disconnect()
@@ -860,7 +1090,12 @@ def test_policy_reset_is_a_noop_without_configured_pose(tmp_path):
 
 def test_worker_runtime_uses_latest_command_and_stale_watchdog_enters_idle():
     backend = FakeBackend()
-    runtime = ArmWorkerRuntime(backend, command_ttl_s=0.1)
+    application_clock_ns = 1
+    runtime = ArmWorkerRuntime(
+        backend,
+        command_ttl_s=0.1,
+        monotonic_ns=lambda: application_clock_ns,
+    )
     runtime.handle_control(ArmControl(sequence=1, operation="arm"))
     runtime.offer_command(ArmCommand(sequence=1, execute_at_ns=0, positions=(0.1,) * 7))
     runtime.offer_command(ArmCommand(sequence=2, execute_at_ns=0, positions=(0.2,) * 7))
@@ -878,6 +1113,178 @@ def test_worker_runtime_uses_latest_command_and_stale_watchdog_enters_idle():
     assert backend.idle_calls >= 2
     runtime.close()
     assert backend.close_calls == 1
+
+
+def test_worker_expiry_boundary_checks_immediately_before_driver_call() -> None:
+    deadline_ns = 50
+    backend = FakeBackend()
+    clock_values = iter((deadline_ns, deadline_ns))
+    runtime = ArmWorkerRuntime(
+        backend,
+        command_ttl_s=1.0,
+        monotonic_ns=lambda: next(clock_values),
+    )
+    runtime.handle_control(ArmControl(sequence=1, operation="arm"))
+    runtime.offer_command(
+        ArmCommand(
+            sequence=1,
+            execute_at_ns=0,
+            positions=(0.1,) * 7,
+            expires_at_ns=deadline_ns,
+        )
+    )
+
+    at_boundary = runtime.tick(now_ns=0)
+
+    assert len(backend.commands) == 1
+    assert at_boundary.last_dispatch_started_monotonic_ns == deadline_ns
+    assert at_boundary.last_driver_acknowledged_monotonic_ns == deadline_ns
+    assert at_boundary.fault is None
+
+    expired_backend = FakeBackend()
+    expired_runtime = ArmWorkerRuntime(
+        expired_backend,
+        command_ttl_s=1.0,
+        monotonic_ns=lambda: deadline_ns + 1,
+    )
+    expired_runtime.handle_control(ArmControl(sequence=1, operation="arm"))
+    expired_runtime.offer_command(
+        ArmCommand(
+            sequence=1,
+            execute_at_ns=0,
+            positions=(0.1,) * 7,
+            expires_at_ns=deadline_ns,
+        )
+    )
+
+    expired = expired_runtime.tick(now_ns=0)
+
+    assert expired_backend.commands == []
+    assert expired.fault == "command_expired_before_worker_dispatch"
+    assert expired.fault_monotonic_ns == deadline_ns + 1
+    assert not expired.armed
+
+
+def test_worker_records_late_driver_acknowledgement_and_disarms() -> None:
+    deadline_ns = 50
+    backend = FakeBackend()
+    clock_values = iter((deadline_ns, deadline_ns + 1))
+    runtime = ArmWorkerRuntime(
+        backend,
+        command_ttl_s=1.0,
+        monotonic_ns=lambda: next(clock_values),
+    )
+    runtime.handle_control(ArmControl(sequence=1, operation="arm"))
+    runtime.offer_command(
+        ArmCommand(
+            sequence=1,
+            execute_at_ns=0,
+            positions=(0.1,) * 7,
+            expires_at_ns=deadline_ns,
+        )
+    )
+
+    late_acknowledgement = runtime.tick(now_ns=0)
+
+    # The driver call started exactly at the allowed boundary, so it did run.
+    # Its return is only an acknowledgement (not proof of physical motion), and
+    # returning after expiry must still fault and enter safe idle.
+    assert len(backend.commands) == 1
+    assert late_acknowledgement.last_dispatch_started_monotonic_ns == deadline_ns
+    assert late_acknowledgement.last_driver_acknowledged_monotonic_ns == deadline_ns + 1
+    assert late_acknowledgement.fault == "command_acknowledged_after_expiry"
+    assert late_acknowledgement.fault_monotonic_ns == deadline_ns + 1
+    assert not late_acknowledgement.armed
+    assert late_acknowledgement.idle
+
+
+def test_guarded_dispatch_requires_reviewed_margin_before_either_worker_queue(tmp_path) -> None:
+    robot, workers = make_robot(tmp_path)
+    robot.connect()
+    robot.arm()
+    deadline_ns = time.monotonic_ns() + 20_000_000
+
+    with pytest.raises(RuntimeError, match="required reviewed worker dispatch margin"):
+        robot.send_action_from_measured_state(
+            lambda _measured: zero_action(),
+            expires_at_monotonic_ns=deadline_ns,
+            required_expiry_margin_ns=50_000_000,
+        )
+
+    assert workers["left"].commands == []
+    assert workers["right"].commands == []
+    assert not robot.is_armed
+    assert robot.last_dispatch_timing["required_expiry_margin_ns"] == 50_000_000
+    robot.disconnect()
+
+
+def test_guarded_dispatch_uses_exact_measured_state_and_records_worker_boundaries(tmp_path) -> None:
+    robot, workers = make_robot(tmp_path)
+    robot.connect()
+    robot.arm()
+    captured = []
+    deadline_ns = time.monotonic_ns() + 1_000_000_000
+
+    applied = robot.send_action_from_measured_state(
+        lambda measured: captured.append(dict(measured)) or dict(measured),
+        expires_at_monotonic_ns=deadline_ns,
+        required_expiry_margin_ns=50_000_000,
+    )
+
+    assert captured == [applied]
+    timing = robot.last_dispatch_timing
+    assert timing["state_before_dispatch"] == pytest.approx([captured[0][key] for key in YAM_SCALAR_KEYS])
+    assert set(timing["worker_dispatch_started_monotonic_ns"]) == {"left", "right"}
+    assert set(timing["worker_driver_acknowledged_monotonic_ns"]) == {"left", "right"}
+    for side in ("left", "right"):
+        assert (
+            timing["worker_dispatch_started_monotonic_ns"][side]
+            <= timing["worker_driver_acknowledged_monotonic_ns"][side]
+            <= deadline_ns
+        )
+        assert workers[side].commands[-1].expires_at_ns == deadline_ns
+    robot.disconnect()
+
+
+def test_two_arm_expiry_asymmetry_is_nonatomic_and_idles_both(tmp_path) -> None:
+    robot, workers = make_robot(tmp_path)
+    robot.connect()
+    robot.arm()
+    deadline_ns = time.monotonic_ns() + 1_000_000_000
+
+    def reject_right(sequence: int, timeout_s: float) -> ArmState:
+        del timeout_s
+        return_state = ArmState(
+            sequence=99,
+            timestamp_ns=deadline_ns + 1,
+            positions=tuple(workers["right"].positions),
+            ready=True,
+            armed=False,
+            idle=True,
+            control_sequence=workers["right"].control_sequence,
+            last_applied_command_sequence=sequence - 1,
+            last_applied_positions=None,
+            fault="command_expired_before_worker_dispatch",
+            fault_monotonic_ns=deadline_ns + 1,
+        )
+        raise ArmCommandError("right", return_state)
+
+    workers["right"].wait_applied = reject_right
+
+    with pytest.raises(ArmCommandError, match="right arm command failed"):
+        robot.send_action_from_measured_state(
+            lambda _measured: zero_action(),
+            expires_at_monotonic_ns=deadline_ns,
+            required_expiry_margin_ns=50_000_000,
+        )
+
+    timing = robot.last_dispatch_timing
+    assert set(timing["worker_dispatch_started_monotonic_ns"]) == {"left"}
+    assert timing["worker_rejected_monotonic_ns"] == {"right": deadline_ns + 1}
+    assert not robot.is_armed
+    assert workers["left"].disarm_calls >= 1
+    assert workers["right"].disarm_calls >= 1
+    robot.disconnect()
 
 
 def test_i2rt_hardware_backend_stops_threads_before_closing_can():

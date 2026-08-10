@@ -16,6 +16,8 @@ from lerobot.remote_inference.codec import (
     action_to_proto,
     embodiment_from_proto,
     embodiment_to_proto,
+    model_from_proto,
+    model_to_proto,
     observation_from_proto,
     observation_to_proto,
 )
@@ -169,3 +171,30 @@ def test_action_codec_roundtrip_and_fingerprint_validation():
     message.model_fingerprint = "wrong"
     with pytest.raises(ProtocolValidationError, match="fingerprint"):
         action_from_proto(message, expected_session_id="session", model=model)
+
+
+def test_model_manifest_roundtrips_explicit_gripper_action_representation():
+    model = replace(
+        make_model(),
+        gripper_action_representation="query_anchor_delta_normalized_width",
+        artifact_tree_sha256="a" * 64,
+        artifact_manifest_sha256="c" * 64,
+        ik_release_report_sha256="b" * 64,
+    )
+
+    decoded = model_from_proto(model_to_proto(model))
+
+    assert decoded == model
+
+
+def test_empty_gripper_action_representation_is_absent_from_legacy_wire_payload():
+    message = model_to_proto(make_model())
+
+    assert message.gripper_action_representation == ""
+    assert message.artifact_tree_sha256 == ""
+    assert message.artifact_manifest_sha256 == ""
+    assert message.ik_release_report_sha256 == ""
+    assert "gripper_action_representation" not in {field.name for field, _value in message.ListFields()}
+    assert "artifact_tree_sha256" not in {field.name for field, _value in message.ListFields()}
+    assert "artifact_manifest_sha256" not in {field.name for field, _value in message.ListFields()}
+    assert "ik_release_report_sha256" not in {field.name for field, _value in message.ListFields()}

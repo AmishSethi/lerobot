@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import threading
 import time
@@ -37,6 +39,7 @@ class RemotePolicyServerConfig:
     host: str = "127.0.0.1"
     port: int = 8081
     service_name: str = "lerobot-remote-policy"
+    server_revision: str = "development"
     max_message_bytes: int = 16 * 1024 * 1024
     max_image_bytes: int = 8 * 1024 * 1024
     max_decoded_image_bytes: int = 64 * 1024 * 1024
@@ -48,9 +51,36 @@ class RemotePolicyServerConfig:
     tls_key_path: str | None = None
     tls_client_ca_path: str | None = None
 
+    def canonical_runtime_contract(self) -> dict[str, object]:
+        """Return the non-secret effective server settings bound to sessions."""
+
+        return {
+            "host": self.host,
+            "port": self.port,
+            "service_name": self.service_name,
+            "server_revision": self.server_revision,
+            "max_message_bytes": self.max_message_bytes,
+            "max_image_bytes": self.max_image_bytes,
+            "max_decoded_image_bytes": self.max_decoded_image_bytes,
+            "max_task_chars": self.max_task_chars,
+            "command_ttl_ms": self.command_ttl_ms,
+            "session_idle_timeout_s": self.session_idle_timeout_s,
+            "max_workers": self.max_workers,
+            "tls_enabled": self.tls_cert_path is not None,
+            "mutual_tls_enabled": self.tls_client_ca_path is not None,
+        }
+
+    def runtime_contract_sha256(self) -> str:
+        payload = json.dumps(
+            self.canonical_runtime_contract(), sort_keys=True, separators=(",", ":")
+        ).encode()
+        return hashlib.sha256(payload).hexdigest()
+
     def validate(self) -> None:
         if not self.host or not 1 <= self.port <= 65535:
             raise ValueError("server host and port are invalid")
+        if not self.service_name.strip() or not self.server_revision.strip():
+            raise ValueError("service_name and server_revision must be non-empty")
         if self.max_message_bytes <= 0 or self.max_image_bytes <= 0 or self.max_decoded_image_bytes <= 0:
             raise ValueError("message and image byte limits must be positive")
         if self.max_image_bytes > self.max_message_bytes:
@@ -165,6 +195,8 @@ class RemotePolicyService(remote_policy_pb2_grpc.RemotePolicyServiceServicer):
             session_id=session_id,
             model=model_to_proto(self._backend.manifest),
             command_ttl_ms=self._config.command_ttl_ms,
+            server_revision=self._config.server_revision,
+            server_config_sha256=self._config.runtime_contract_sha256(),
         )
 
     def Infer(self, request, context):  # noqa: N802
@@ -272,7 +304,13 @@ def serve(config: RemotePolicyServerConfig, backend: PolicyBackend) -> None:
     backend.warmup()
     server, _ = create_grpc_server(config, backend)
     server.start()
-    logger.info("Remote policy server listening on %s:%d", config.host, config.port)
+    logger.info(
+        "Remote policy server listening on %s:%d revision=%s config_sha256=%s",
+        config.host,
+        config.port,
+        config.server_revision,
+        config.runtime_contract_sha256(),
+    )
     try:
         server.wait_for_termination()
     finally:
